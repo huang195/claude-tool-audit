@@ -55,41 +55,89 @@ left alone. Undo is one line.
 
 ## Sample output
 
-```
-History: 171 transcript files, 4478 API turns, 5119 tool calls  2026-07-28 .. 2026-08-27
-Claude Code versions seen: 2.1.237, 2.1.238, 2.1.241
-Your input tokens split: 0.2% uncached / 6.5% cache-write / 93.3% cache-read
-=> at that mix, every 1,000 tokens of tool schema costs you $3.95 across 4478 turns
-
-TOOLS YOU CALLED (19)
-  Bash                                   3867
-  Read                                    446
-  Edit                                    241
-  ...
-
-DECLARED BUT NEVER CALLED (14)
-  tool                   tokens   $/window  note
-  ----------------------------------------------
-   Workflow                7924     $31.33  multi-agent orchestration; opt-in by keyword
-   DesignSync              3287     $13.00  syncs a component library to claude.ai/design
-   ScheduleWakeup          1809      $7.15  paces /loop dynamic mode
-  !SendMessage             1619      $6.40  needed to talk to subagents you spawn with Agent
-  !EnterWorktree           1469      $5.81  git worktree workflow; keep if your repo documents one
-  ...
-  low-risk subtotal         16119 tokens  $63.74 over 4478 turns
-  check-first subtotal       5267 tokens  $20.83  (marked !)
-  never-called schemas are 71% of your declared manifest by wire bytes
-```
-
-And with `--measure`, on the same machine:
+It opens with the answer, then shows the work. Abridged:
 
 ```
-MEASURING (2 API calls, prompt "say ok", empty directory)...
-  baseline manifest           39238 prompt tokens
-  with  9 tools denied        23123 prompt tokens
-  measured saving             16115 tokens/turn (41.1%)
-  at your own volume       $63.51 over 4466 turns
-  (table estimated 16119; measured/estimate = 1.00)
+==========================================================================
+Claude Code tool audit                                        last 30 days
+==========================================================================
+
+THE SHORT VERSION
+-----------------
+  14 of the 25 built-in tools were sent to the model on every one of your
+  4,503 requests, and you never called them once.
+
+  Turning off the 9 that are safe to remove would take 16,119 tokens out
+  of every request, worth about $64.09 over these 30 days.
+
+  A further 5 are unused too, but removing one of those could break a
+  workflow, so they are listed separately and left alone unless you ask
+  for them.
+
+  Next step:
+    python3 claude-tool-audit.py --measure
+        check that number against the real API (2 requests)
+    python3 claude-tool-audit.py --apply
+        turn them off -- asks first, backs up your settings
+
+WHAT YOUR HISTORY SHOWS
+-----------------------
+  period       2026-07-28 to 2026-08-27
+  requests     4,503  (one per exchange with the model)
+  tool calls   5,141  across 19 different tools
+  most used    Bash 3,875, Read 448, Edit 253, TaskUpdate 133, Write 132,
+               TaskCreate 85
+               ...and 13 more (--verbose for all of them)
+
+SAFE TO TURN OFF -- 9 tools, 16,119 tokens per request, $64.09 over 30 days
+---------------------------------------------------------------------------
+  Never called, and nothing else you use depends on them.
+
+    tool                tokens      cost   what it is
+    Workflow             7,924    $31.51   runs multi-agent workflows (opt-in by keyword)
+    DesignSync           3,287    $13.07   syncs a component library to claude.ai/design
+    ScheduleWakeup       1,809     $7.19   paces /loop when you run it without an interval
+    CronCreate           1,337     $5.32   schedules a prompt to run later
+    PushNotification       650     $2.58   sends you a desktop or phone notification
+    NotebookEdit           593     $2.36   edits Jupyter .ipynb cells
+    WebSearch              305     $1.21   searches the web; an MCP search tool replaces it
+    CronDelete             130     $0.52   cancels a scheduled prompt
+    CronList                84     $0.33   lists scheduled prompts
+
+CHECK FIRST -- 5 tools, 5,267 tokens per request, $20.94 over 30 days
+---------------------------------------------------------------------
+  Never called either, but removing one of these could break a workflow,
+  so they are left out unless you pass --include-check-first.
+
+    tool                tokens      cost   what it is
+    SendMessage          1,619     $6.44   how Claude reaches subagents spawned by Agent
+                                           (you called Agent 73 times in this window)
+    EnterWorktree        1,469     $5.84   keep if your repo documents a worktree workflow
+    ...
+```
+
+Then a `MCP SERVERS` section, a `HOW THESE NUMBERS WERE MADE` footer with the
+assumptions and the privacy note, and the exact `settings.json` snippet if you
+would rather paste it by hand than run `--apply`.
+
+With `--measure` it adds a block that replaces the estimate with ground truth:
+
+```
+MEASURED AGAINST THE REAL API
+-----------------------------
+  Sending two requests with the prompt "say ok" from an empty directory --
+  one with your normal tools, one with these 9 switched off. The
+  difference is exactly what they cost you, on your machine and your
+  Claude Code version.
+
+    every tool on         39,240 tokens in the request
+     9 tools off          23,125 tokens in the request
+    ----------------------------------------------
+    you save              16,115 tokens, every request
+                           41.1% of that request
+                          $64.15 over your last 4,510 requests
+
+  The estimate above said 16,119 tokens, so measured / estimated = 1.00.
 ```
 
 The estimate and the wire delta agreed to 0.03% there. Don't read that as
@@ -109,9 +157,10 @@ your local `settings.json`, after a backup.
 ## Caveats, stated up front
 
 - **"Never called" is not "never useful."** A tool you have not needed yet may be
-  the right tool next week. The script splits candidates into **low-risk** and
-  **check-first** (`!`) for this reason and holds the latter back unless you pass
-  `--include-check-first`. Every change is one line in `settings.json` to undo.
+  the right tool next week. The script splits candidates into **safe to turn off**
+  and **check first** for this reason, holds the latter back unless you pass
+  `--include-check-first`, and says on the row when a tool you *do* use depends
+  on one. Every change is one list in `settings.json` to undo.
 - **Per-tool token figures carry roughly ±15%.** Schema JSON does not tokenize
   uniformly: prose-heavy descriptions land near 2.8 chars/token, punctuation-dense
   ones near 2.4. The ratio is calibrated against a direct wire measurement of a
@@ -141,7 +190,8 @@ your local `settings.json`, after a backup.
 | `--measure` | verify the estimate with 2 API calls |
 | `--apply` | prompt to write `permissions.deny` |
 | `--yes` | with `--apply`, skip the confirmation |
-| `--include-check-first` | also offer the `!`-flagged tools |
+| `--include-check-first` | also offer the check-first tools |
+| `--verbose` | list every tool you called, not just the top few |
 | `--settings PATH` | edit a different settings file |
 | `--price-*` | override list prices, USD per Mtok |
 

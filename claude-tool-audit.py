@@ -33,6 +33,7 @@ USAGE
     python3 claude-tool-audit.py                  # report only
     python3 claude-tool-audit.py --measure        # + verify with 2 API calls
     python3 claude-tool-audit.py --apply          # + prompt to edit settings
+    python3 claude-tool-audit.py --verbose        # + list every tool you called
 
 CAVEATS, STATED UP FRONT
 ------------------------
@@ -57,6 +58,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 
 # ---------------------------------------------------------------------------
 # Measured tool manifest.
@@ -79,44 +81,50 @@ CHARS_PER_TOKEN = 2.754
 
 TOOLS = {
     # name: (chars, group, risk, note)
+    #
+    # For "low" tools the note says what the tool does -- so you can tell at a
+    # glance whether you would miss it. For "check" tools the note says why you
+    # might want to keep it, since that is the decision you actually face.
     "Workflow": (21822, "orchestration", "low",
-                 "multi-agent orchestration; opt-in by keyword, largest single schema"),
+                 "runs multi-agent workflows (opt-in by keyword)"),
     "DesignSync": (9053, "specialized", "low",
                    "syncs a component library to claude.ai/design"),
     "Monitor": (7599, "scheduling", "low",
                 "streams events from a long-running command"),
     "ScheduleWakeup": (4982, "scheduling", "low",
-                       "paces /loop dynamic mode"),
+                       "paces /loop when you run it without an interval"),
     "SendMessage": (4459, "orchestration", "check",
-                    "needed to talk to subagents you spawn with Agent"),
+                    "how Claude reaches subagents spawned by Agent"),
     "EnterWorktree": (4047, "worktree", "check",
-                      "git worktree workflow; keep if your repo documents one"),
-    "CronCreate": (3681, "scheduling", "low", "scheduled prompts"),
+                      "keep if your repo documents a worktree workflow"),
+    "CronCreate": (3681, "scheduling", "low",
+                   "schedules a prompt to run later"),
     "Agent": (3174, "orchestration", "check",
               "spawns subagents; usually worth keeping"),
-    "Bash": (2870, "core", "check", "core shell access"),
+    "Bash": (2870, "core", "check", "shell access"),
     "ExitWorktree": (2520, "worktree", "check", "pairs with EnterWorktree"),
     "LSP": (2311, "specialized", "check",
-            "language-server lookups; useful in large typed codebases"),
+            "code navigation in large typed codebases"),
     "ReportFindings": (2187, "specialized", "low",
-                       "structured output for code-review skills"),
+                       "structured output used by code-review skills"),
     "Skill": (1824, "specialized", "check",
-              "invokes skills; keep if you use slash commands"),
+              "runs skills; keep if you use slash commands"),
     "PushNotification": (1790, "scheduling", "low",
-                         "desktop/phone notification"),
-    "NotebookEdit": (1633, "core", "low", "Jupyter .ipynb cell edits"),
-    "Read": (1597, "core", "check", "core file read"),
+                         "sends you a desktop or phone notification"),
+    "NotebookEdit": (1633, "core", "low", "edits Jupyter .ipynb cells"),
+    "Read": (1597, "core", "check", "reads files"),
     "TaskOutput": (1561, "orchestration", "low",
-                   "deprecated; background tasks report their own output path"),
-    "ListAgents": (1171, "orchestration", "check", "pairs with SendMessage"),
-    "Edit": (968, "core", "check", "core file edit"),
+                   "deprecated; tasks now report their own output path"),
+    "ListAgents": (1171, "orchestration", "check",
+                   "lists subagents so SendMessage can reach them"),
+    "Edit": (968, "core", "check", "edits files"),
     "WebSearch": (841, "web", "low",
-                  "redundant if you have an MCP search tool"),
+                  "searches the web; an MCP search tool replaces it"),
     "TaskStop": (805, "orchestration", "low", "kills a background task"),
     "WebFetch": (750, "web", "check", "fetches and summarizes a URL"),
-    "Write": (639, "core", "check", "core file write"),
-    "CronDelete": (359, "scheduling", "low", "pairs with CronCreate"),
-    "CronList": (232, "scheduling", "low", "pairs with CronCreate"),
+    "Write": (639, "core", "check", "writes files"),
+    "CronDelete": (359, "scheduling", "low", "cancels a scheduled prompt"),
+    "CronList": (232, "scheduling", "low", "lists scheduled prompts"),
     # Interactive-only: present in a real session, absent from headless runs.
     # Never propose denying these -- they are how the session talks to you.
     "TaskCreate": (0, "interactive", "interactive", ""),
@@ -126,6 +134,19 @@ TOOLS = {
     "EnterPlanMode": (0, "interactive", "interactive", ""),
     "ExitPlanMode": (0, "interactive", "interactive", ""),
     "EndConversation": (0, "interactive", "interactive", ""),
+}
+
+# A tool you never called may still be needed by a tool you *do* call. When the
+# partner shows up in your history we say so on the row, because that is the
+# single most useful thing to know before removing it.
+PARTNER = {
+    "SendMessage": "Agent",
+    "ListAgents": "Agent",
+    "ExitWorktree": "EnterWorktree",
+    "CronDelete": "CronCreate",
+    "CronList": "CronCreate",
+    "TaskOutput": "Agent",
+    "TaskStop": "Agent",
 }
 
 # Anthropic list prices, USD per million tokens (Claude Opus 4.6 / 5 tier).
@@ -311,24 +332,26 @@ def apply_deny(path, names, assume_yes):
 
     additions = [n for n in sorted(names) if n not in deny]
     if not additions:
-        print("  already denied, nothing to do")
+        print("\n  These are already in permissions.deny. Nothing to do.")
         return False
 
-    print("\n  will add to permissions.deny in %s:" % path)
+    print("\n  Editing %s" % path)
+    print("  Adding to permissions.deny, and changing nothing else:")
     for n in additions:
         print("    + %s" % n)
     if not assume_yes:
         if not sys.stdin.isatty():
-            print("  stdin is not a terminal; re-run interactively or pass --yes")
+            print("\n  Not running in a terminal, so there is nobody to ask.")
+            print("  Re-run interactively, or pass --yes to skip the prompt.")
             return False
-        if input("  proceed? [y/N] ").strip().lower() not in ("y", "yes"):
-            print("  skipped")
+        if input("\n  Go ahead? [y/N] ").strip().lower() not in ("y", "yes"):
+            print("  Left your settings alone.")
             return False
 
+    backup = None
     if os.path.exists(path):
         backup = path + ".bak"
         shutil.copy2(path, backup)
-        print("  backup: %s" % backup)
     else:
         os.makedirs(os.path.dirname(path), exist_ok=True)
 
@@ -338,8 +361,13 @@ def apply_deny(path, names, assume_yes):
         json.dump(cfg, fh, indent=2)
         fh.write("\n")
     os.replace(tmp, path)
-    print("  written. undo by deleting those %d lines, or: mv %s.bak %s"
-          % (len(additions), path, path))
+
+    print("\n  Done -- %d tool(s) turned off. Takes effect in new sessions."
+          % len(additions))
+    if backup:
+        print("  Your previous settings: %s" % backup)
+        print("  To undo everything:     mv %s %s" % (backup, path))
+    print("  To undo one tool, delete its name from permissions.deny.")
     return True
 
 
@@ -372,6 +400,44 @@ def configured_mcp_servers():
 
 
 # ---------------------------------------------------------------------------
+# Report formatting
+# ---------------------------------------------------------------------------
+
+WIDTH = 74            # prose wraps here
+ROW = "    %-18s %7s  %8s   %s"   # tool | tokens | cost | note
+ROW_NOTE_COL = 43     # where the note column starts, for continuation lines
+
+
+def num(n):
+    return "{:,}".format(int(round(n)))
+
+
+def usd(x):
+    return "${:,.2f}".format(x)
+
+
+def para(text, indent="  "):
+    """Wrap a paragraph so it reads the same on every terminal."""
+    print(textwrap.fill(" ".join(text.split()), width=WIDTH,
+                        initial_indent=indent, subsequent_indent=indent))
+
+
+def head(title):
+    print("\n" + title)
+    print("-" * min(len(title), 90))
+
+
+def table(rows, per_tok, turns):
+    """rows: list of (name, tokens, note, hint). hint gets its own line."""
+    print(ROW % ("tool", "tokens", "cost", "what it is"))
+    for name, tk, note, hint in rows:
+        cost = usd(tk * per_tok * turns) if per_tok else "-"
+        print(ROW % (name, num(tk), cost, note))
+        if hint:
+            print(" " * ROW_NOTE_COL + hint)
+
+
+# ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
 
@@ -388,6 +454,8 @@ def main():
                     help="with --apply, skip the confirmation prompt")
     ap.add_argument("--include-check-first", action="store_true",
                     help="also offer the tools flagged check-first")
+    ap.add_argument("--verbose", action="store_true",
+                    help="list every tool you called, not just the top few")
     ap.add_argument("--settings", help="settings.json to edit (default ~/.claude)")
     for k in PRICE:
         ap.add_argument("--price-" + k.replace("_", "-"), type=float,
@@ -397,153 +465,247 @@ def main():
     args = ap.parse_args()
     price = {k: getattr(args, "price_" + k) for k in PRICE}
 
-    print("Claude Code tool-manifest audit -- last %d days" % args.days)
-    print("Reads tool names, ids, timestamps and token counts only. "
-          "No prompts, arguments, or results.\n")
+    banner = "Claude Code tool audit"
+    right = "last %d days" % args.days
+    print("=" * WIDTH)
+    print(banner + " " * max(1, WIDTH - len(banner) - len(right)) + right)
+    print("=" * WIDTH)
 
     s = scan(args.days)
     if not s["turns"]:
-        print("No transcripts found in the window. Nothing to analyse.")
-        print("(Looked in ~/.claude/projects; found %d files.)" % s["files"])
+        print("\nNo Claude Code history found in the last %d days, so there is"
+              % args.days)
+        print("nothing to analyse. (Looked in ~/.claude/projects, found %d files.)"
+              % s["files"])
         return 0
 
     called = collections.Counter(s["main"]) + collections.Counter(s["sub"])
     per_tok, shares = blended_price_per_token(s["usage"], price)
 
-    span = ""
-    if s["first"] and s["last"]:
-        span = "  %s .. %s" % (s["first"].date(), s["last"].date())
-    print("History: %d transcript files, %d API turns, %d tool calls%s"
-          % (s["files"], s["turns"], s["calls"], span))
-    if s["versions"]:
-        print("Claude Code versions seen: %s"
-              % ", ".join(sorted(s["versions"])[-3:]))
-    if shares:
-        print("Your input tokens split: %.1f%% uncached / %.1f%% cache-write "
-              "/ %.1f%% cache-read" % tuple(x * 100 for x in shares))
-        print("=> at that mix, every 1,000 tokens of tool schema costs you "
-              "$%.2f across %d turns" % (1000 * per_tok * s["turns"], s["turns"]))
-    print()
-
-    # --- what you actually use -------------------------------------------
-    print("TOOLS YOU CALLED (%d)" % len(called))
-    for name, n in called.most_common():
-        mark = "" if name in TOOLS else "   <- not in this script's table"
-        print("  %-36s %6d%s" % (name, n, mark))
-
-    unknown = [n for n in called if n not in TOOLS]
-    if unknown:
-        print("\n  %d tool(s) above are unknown to this script's measured table."
-              % len(unknown))
-        print("  That usually means a newer Claude Code, or MCP tools. They are")
-        print("  never proposed for denial and not priced.")
-
-    # --- what you never touched ------------------------------------------
+    # Split what you never called into "safe" and "check first", biggest first.
     never = [n for n, (c, g, risk, note) in sorted(
         TOOLS.items(), key=lambda kv: -kv[1][0])
         if n not in called and risk != "interactive" and c > 0]
 
-    print("\nDECLARED BUT NEVER CALLED (%d)" % len(never))
+    def row(name):
+        partner = PARTNER.get(name)
+        hint = ""
+        if partner and called.get(partner):
+            hint = "(you called %s %s times in this window)" % (
+                partner, num(called[partner]))
+        return name, tokens_of(name), TOOLS[name][3], hint
+
+    safe_rows = [row(n) for n in never if TOOLS[n][2] == "low"]
+    check_rows = [row(n) for n in never if TOOLS[n][2] != "low"]
+    low = [r[0] for r in safe_rows]
+    check = [r[0] for r in check_rows]
+    tot_safe = sum(r[1] for r in safe_rows)
+    tot_check = sum(r[1] for r in check_rows)
+    candidates = low + (check if args.include_check_first else [])
+    known = len([1 for v in TOOLS.values() if v[2] != "interactive"])
+
+    # --- 1. the answer, before anything else ------------------------------
+    head("THE SHORT VERSION")
     if not never:
-        print("  none -- your manifest is already tight.")
-    hdr = "  %-20s %8s %10s  %s" % ("tool", "tokens", "$/window", "note")
-    print(hdr)
-    print("  " + "-" * (len(hdr) - 2))
-    low, check = [], []
-    tot_low = tot_check = 0
-    for name in never:
-        chars, group, risk, note = TOOLS[name]
-        tk = tokens_of(name)
-        cost = tk * per_tok * s["turns"] if per_tok else 0
-        flag = " " if risk == "low" else "!"
-        print("  %s%-19s %8d %10s  %s"
-              % (flag, name, tk, "$%.2f" % cost, note))
-        if risk == "low":
-            low.append(name)
-            tot_low += tk
-        else:
-            check.append(name)
-            tot_check += tk
+        para("Nothing to trim. You have actually used every tool Claude "
+             "declares to the model in the last %d days." % args.days)
+    else:
+        para("%d of the %d built-in tools were sent to the model on every one "
+             "of your %s requests, and you never called them once."
+             % (len(never), known, num(s["turns"])))
+        if safe_rows:
+            money = (", worth about %s over these %d days"
+                     % (usd(tot_safe * per_tok * s["turns"]), args.days)
+                     if per_tok else "")
+            print()
+            para("Turning off the %d that are safe to remove would take %s "
+                 "tokens out of every request%s."
+                 % (len(safe_rows), num(tot_safe), money))
+        if check_rows:
+            print()
+            para("A further %d are unused too, but removing one of those could "
+                 "break a workflow, so they are listed separately and left "
+                 "alone unless you ask for them." % len(check_rows))
+        me = os.path.basename(sys.argv[0])
+        print("\n  Next step:")
+        print("    python3 %s --measure" % me)
+        print("        check that number against the real API (2 requests)")
+        print("    python3 %s --apply" % me)
+        print("        turn them off -- asks first, backs up your settings")
 
-    if per_tok:
-        print("\n  low-risk subtotal      %8d tokens  $%.2f over %d turns"
-              % (tot_low, tot_low * per_tok * s["turns"], s["turns"]))
-        if check:
-            print("  check-first subtotal   %8d tokens  $%.2f  (marked !)"
-                  % (tot_check, tot_check * per_tok * s["turns"]))
-        # Share is computed from wire bytes, which are exact, rather than from
-        # derived token counts.
-        all_chars = sum(v[0] for v in TOOLS.values())
-        dead_chars = sum(TOOLS[n][0] for n in never)
-        print("  never-called schemas are %.0f%% of your declared manifest "
-              "by wire bytes" % (100.0 * dead_chars / all_chars))
-    print("\n  ! = removing this plausibly breaks a workflow. Read the note.")
-    print("  Estimates use this script's measured schema sizes (+/-15% per tool)")
-    print("  and your own turn count and cache mix. Pass --measure for exact.")
+    # --- 2. why it costs anything -----------------------------------------
+    head("WHY UNUSED TOOLS COST MONEY")
+    para("Claude Code re-sends the full description of every tool it has on "
+         "every request, whether the tool gets called or not. On a minimal "
+         "request, those descriptions were 89% of the entire prompt. Switching "
+         "a tool off removes its description from the request, so you stop "
+         "paying for it -- it is not just an execution block.")
 
-    # --- MCP servers ------------------------------------------------------
+    # --- 3. your history --------------------------------------------------
+    head("WHAT YOUR HISTORY SHOWS")
+    if s["first"] and s["last"]:
+        print("  period       %s to %s" % (s["first"].date(), s["last"].date()))
+    print("  requests     %s  (one per exchange with the model)"
+          % num(s["turns"]))
+    print("  tool calls   %s  across %d different tools"
+          % (num(s["calls"]), len(called)))
+    top = called.most_common(None if args.verbose else 6)
+    print(textwrap.fill(
+        ", ".join("%s %s" % (n, num(c)) for n, c in top),
+        width=WIDTH, initial_indent="  most used    ",
+        subsequent_indent=" " * 15))
+    if not args.verbose and len(called) > len(top):
+        print("               ...and %d more (--verbose for all of them)"
+              % (len(called) - len(top)))
+    if s["versions"]:
+        print("  Claude Code  %s" % ", ".join(sorted(s["versions"])[-3:]))
+
+    unknown = sorted(n for n in called if n not in TOOLS)
+    if unknown:
+        print()
+        para("%d tool(s) you called are not in this script's size table, so "
+             "they are neither priced nor ever proposed for removal. That "
+             "normally means an MCP tool, or a newer Claude Code than the one "
+             "this table was measured on:" % len(unknown))
+        for n in unknown:
+            print("    %s" % n)
+
+    # --- 4. the two candidate lists ---------------------------------------
+    def sized(label, n_tools, toks):
+        if not per_tok:
+            return "%s -- %d tools, %s tokens per request" % (label, n_tools,
+                                                             num(toks))
+        return "%s -- %d tools, %s tokens per request, %s over %d days" % (
+            label, n_tools, num(toks), usd(toks * per_tok * s["turns"]),
+            args.days)
+
+    if safe_rows:
+        head(sized("SAFE TO TURN OFF", len(safe_rows), tot_safe))
+        para("Never called, and nothing else you use depends on them.")
+        print()
+        table(safe_rows, per_tok, s["turns"])
+
+    if check_rows:
+        head(sized("CHECK FIRST", len(check_rows), tot_check))
+        para("Never called either, but removing one of these could break a "
+             "workflow, so they are left out unless you pass "
+             "--include-check-first. The note says why you might keep it.")
+        print()
+        table(check_rows, per_tok, s["turns"])
+
+    # --- 5. MCP servers ---------------------------------------------------
     servers = configured_mcp_servers()
     if servers:
         used = {n.split("__")[1] for n in called if n.startswith("mcp__")
                 and len(n.split("__")) > 2}
         idle = sorted(servers - used)
-        print("\nMCP SERVERS: %d configured, %d with calls in the window"
-              % (len(servers), len(servers) - len(idle)))
+        head("MCP SERVERS -- %d configured, %d used in this window"
+             % (len(servers), len(servers) - len(idle)))
         if idle:
-            print("  no calls from: %s" % ", ".join(idle))
-            print("  MCP schemas are often the largest part of a manifest and this")
-            print("  script cannot size them. Drop unused servers from your config,")
-            print("  or run with --strict-mcp-config to exclude them per-session.")
+            para("No calls at all from: %s" % ", ".join(idle))
+            print()
+            para("MCP tool descriptions are often the largest part of a "
+                 "request and this script cannot size them, so they are not in "
+                 "the totals above. Dropping a server you never use is usually "
+                 "the single biggest win available. Remove it from your config, "
+                 "or start a session with --strict-mcp-config to leave all of "
+                 "them out.")
+        else:
+            para("All of them saw calls, so there is nothing to trim here. "
+                 "Note that MCP tool descriptions are not counted in the "
+                 "totals above -- this script cannot size them.")
 
-    # --- optional live measurement ---------------------------------------
-    candidates = low + (check if args.include_check_first else [])
+    # --- 6. optional live measurement -------------------------------------
     if args.measure:
         if not candidates:
-            print("\n--measure: nothing to deny, skipping.")
+            head("MEASURED AGAINST THE REAL API")
+            print("  Nothing to measure -- there is nothing to turn off.")
         else:
-            print("\nMEASURING (2 API calls, prompt \"say ok\", empty directory)...")
+            head("MEASURED AGAINST THE REAL API")
+            para("Sending two requests with the prompt \"say ok\" from an empty "
+                 "directory -- one with your normal tools, one with these %d "
+                 "switched off. The difference is exactly what they cost you, "
+                 "on your machine and your Claude Code version."
+                 % len(candidates))
+            print()
             res, err = measure(candidates)
             if res is None:
-                print("  failed: %s" % err)
+                para("Could not measure: %s" % err)
             else:
                 base, trimmed = res
                 delta = base - trimmed
-                print("  baseline manifest        %8d prompt tokens" % base)
-                print("  with %2d tools denied     %8d prompt tokens"
-                      % (len(candidates), trimmed))
-                print("  measured saving          %8d tokens/turn (%.1f%%)"
-                      % (delta, 100.0 * delta / base if base else 0))
+                print("    every tool on      %9s tokens in the request"
+                      % num(base))
+                print("    %2d tools off       %9s tokens in the request"
+                      % (len(candidates), num(trimmed)))
+                print("    " + "-" * 46)
+                print("    you save           %9s tokens, every request"
+                      % num(delta))
+                print("                       %8.1f%% of that request"
+                      % (100.0 * delta / base if base else 0))
                 if per_tok:
-                    print("  at your own volume       $%.2f over %d turns"
-                          % (delta * per_tok * s["turns"], s["turns"]))
+                    print("                       %9s over your last %s requests"
+                          % (usd(delta * per_tok * s["turns"]), num(s["turns"])))
                 est = sum(tokens_of(n) for n in candidates)
-                if delta:
-                    print("  (table estimated %d; measured/estimate = %.2f)"
-                          % (est, delta / est if est else 0))
+                if delta and est:
+                    print()
+                    para("The estimate above said %s tokens, so measured / "
+                         "estimated = %.2f." % (num(est), delta / est))
 
-    # --- optional apply ---------------------------------------------------
+    # --- 7. how the numbers were made ------------------------------------
+    head("HOW THESE NUMBERS WERE MADE")
+    para("The per-tool token counts come from capturing real Claude Code "
+         "requests, and are good to roughly +/-15% each. Pass --measure to "
+         "replace the estimate with a direct measurement on your own machine.")
+    if shares:
+        print()
+        para("The dollars use your own %s requests and your own input-token "
+             "mix -- %.1f%% uncached, %.1f%% written to cache, %.1f%% read back "
+             "from cache -- at Anthropic list prices. That works out to %s per "
+             "1,000 tokens of tool description over this %d-day window. If you "
+             "bill through a discounted gateway, pass --price-input, "
+             "--price-output, --price-cache-write and --price-cache-read."
+             % ((num(s["turns"]),) + tuple(x * 100 for x in shares)
+                + (usd(1000 * per_tok * s["turns"]), args.days)))
     print()
-    if not args.apply:
-        if candidates:
-            print("To act on this, re-run with --apply (it will prompt, back up your")
-            print("settings, and change nothing else). Or add this by hand to")
-            print("~/.claude/settings.json:")
-            print('  "permissions": { "deny": %s }'
-                  % json.dumps(sorted(candidates)))
-        return 0
+    para("\"Never called\" is not \"never useful\" -- a tool you have not "
+         "needed yet may be the right one next week. Everything here is one "
+         "list in settings.json, and one command to put back.")
+    print()
+    para("What this script read from your transcripts: tool names, ids, "
+         "timestamps and token counts. Never prompts, arguments, results or "
+         "replies. Nothing is sent anywhere unless you pass --measure.")
 
+    # --- 8. act -----------------------------------------------------------
     if not candidates:
-        print("Nothing to deny.")
+        print()
         return 0
 
-    print("DISABLE NEVER-USED TOOLS")
-    print("  %d low-risk tool(s) proposed." % len(low))
+    if not args.apply:
+        head("TO TURN THEM OFF")
+        print("    python3 %s --apply" % os.path.basename(sys.argv[0]))
+        print()
+        para("That shows you the change, asks, backs up your settings and "
+             "touches nothing else. Or merge this into "
+             "~/.claude/settings.json yourself:")
+        print()
+        snippet = json.dumps({"permissions": {"deny": sorted(candidates)}},
+                             indent=2)
+        for ln in snippet.splitlines():
+            print("    " + ln)
+        print()
+        return 0
+
+    head("TURNING THEM OFF")
+    para("%d tool(s) will be added to permissions.deny. Their descriptions "
+         "stop being sent, so Claude will not see or offer them."
+         % len(candidates))
     if check and not args.include_check_first:
-        print("  %d check-first tool(s) held back; pass --include-check-first"
-              " to include them." % len(check))
-    print("  Effect: their schemas stop being sent. Claude will not see or")
-    print("  offer them. Fully reversible by editing one list.")
+        print()
+        para("The %d check-first tool(s) are left alone. Pass "
+             "--include-check-first if you want those too." % len(check))
     apply_deny(settings_path(args.settings), candidates, args.yes)
+    print()
     return 0
 
 
