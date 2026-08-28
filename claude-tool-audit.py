@@ -661,6 +661,16 @@ def main():
         print("  %s to %s   Claude Code %s"
               % (s["first"].date(), s["last"].date(),
                  ", ".join(sorted(s["versions"])[-2:])))
+    # Dollars are only as good as the price basis, and the basis is a guess
+    # unless you know which model served the requests. Percentages survive a
+    # wrong guess -- cache_write/cache_read is 12.5 on every tier -- but the
+    # dollar columns do not, so name the models and let the reader check.
+    if s["models"]:
+        tot_m = sum(s["models"].values()) or 1
+        print("  priced at %s: %s"
+              % ("Opus list" if price == PRICE else "overridden prices",
+                 ", ".join("%s %s" % (m, pct(c / tot_m))
+                           for m, c in s["models"].most_common(3))))
     print()
     print("  %-16s %14s %10s %7s" % ("", "tokens", "cost", "share"))
     for n, t, c in comp:

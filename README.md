@@ -52,9 +52,17 @@ which cost answer quality. They are about not paying twice for the same bytes.
 | **B** | refresh a cache lineage before its 5-minute timer expires | **12.2%** | Claude Code cannot refresh its own cache |
 | | **A + B** | **16.8%** | |
 
-Across four developers measured so far, A lands between 5% and 19% and B between
-6% and 30%. Which lever is larger **depends on the person** — it splits two-two —
-so the numbers below are one machine's, not a forecast for yours.
+Across six developers measured so far, A lands between **3.1% and 18.9%** and B
+between **5.7% and 29.7%**. Which lever is larger **depends on the person** — B
+leads on four of the six — so the numbers below are one machine's, not a forecast
+for yours. Weighted across all six bills, A is worth 8.7% and B is worth 16.8%.
+
+The single quantity that has *not* varied is lever B's **capture rate** — the
+fraction of the addressable pool it recovers. It sat at 40–53% across the first
+five machines, and the sixth, whose usage profile resembled none of them (8 cache
+lineages against 68, a 452 k mean context against 232 k, and cache writes
+outweighing cache reads), came in at 47%. That is the closest thing here to an
+out-of-sample test.
 
 Both live in the request path. Neither changes the bytes the model receives.
 
@@ -76,11 +84,21 @@ needs foresight, so it is not implementable — but it is a genuine upper bound,
 the gap between 5.6% and 6.4% is what per-conversation trimming would be worth on
 top of per-developer trimming.
 
-On the per-developer claim, be careful: across four measured machines the droppable
-sets turned out to be **nested**, and one nine-tool list shared by all four would
-capture 80–100% of each person's dead tokens. That part is achievable with a static
-config and no proxy. What is not achievable statically is the per-conversation
-ceiling above, and the timing of when to apply the change.
+On the per-developer claim, be careful: across six measured machines the droppable
+sets turned out to be **nested**, not disjoint. Eight tools were dead on every
+single machine, and one shared nine-tool list would capture at least 70% of each
+person's dead tokens. That part is achievable with a static config and no proxy.
+What is *not* achievable statically is the per-conversation ceiling above, and the
+timing of when to apply the change.
+
+One scope limit worth stating plainly, because it cuts the other way: the numbers
+above cover **built-in tools only**. Model Context Protocol servers add their own
+schemas to the same manifest, and a server you configured but never call is pure
+dead weight — but a transcript records only the tools that *were* called, so from
+local files a never-used server is invisible by construction. It cannot be
+measured here, and it is not included in any figure above. Only something reading
+the request path sees the whole `tools` array. That makes the request path
+necessary for the **measurement**, not just for the fix.
 
 Tools that were never called but *partner* one that is in use are kept, not
 dropped: `SendMessage` stays because `Agent` is used.
@@ -101,9 +119,11 @@ The measurement that makes this a real finding:
 | refresh requests that adds | 406 |
 
 4.7% of requests carry 77.4% of the most expensive token class. That concentration
-is what makes a narrow intervention worth anything. It reproduces: across four
-machines the idle-gap requests were 4.7–14.3% of traffic and carried 77–90% of all
-cache writes, and lever B captured **40–53%** of that addressable pool every time.
+is what makes a narrow intervention worth anything. It reproduces: across six
+machines the idle-gap requests were **1.9–14.3%** of traffic and carried
+**76–94%** of all cache writes, and lever B captured **40–53%** of that
+addressable pool every time — a band that held even on the machine whose usage
+profile matched none of the others.
 
 **The policy must be selective, and getting that wrong inverts the result:**
 
@@ -133,10 +153,13 @@ tool results, or completions. It writes no files and changes no settings.
 **Nothing leaves your machine.** There are no API calls and no network access — it
 reads local files, prints, and exits.
 
-The output is aggregate numbers and built-in tool names only — no paths, project
-names, branches, prompts, arguments, or MCP server names. Model Context Protocol
-servers and tools are **counted, never named**, because a server name can identify
-an internal system. There is nothing in the output you need to redact.
+The output is aggregate numbers, built-in tool names, Claude Code version strings,
+and model ids only — no paths, project names, branches, prompts, arguments, or MCP
+server names. Model Context Protocol servers and tools are **counted, never
+named**, because a server name can identify an internal system. Model ids are
+printed (`claude-opus-5`, `claude-sonnet-5`, …) because the dollar figures are
+meaningless without knowing what was actually being billed. There is nothing in
+the output you need to redact.
 
 ## Options
 
@@ -166,13 +189,22 @@ None are needed. If you want them:
   right tool next week, so lever A has to be able to put it back.
 - Per-tool token estimates come from a wire capture of Claude Code 2.x and carry
   roughly ±15%. The aggregate is the solid number; any single tool's line is not.
-- Prices default to Opus list. If your gateway bills at a discount, every
-  percentage here is unchanged — only the dollars scale.
+- Prices default to Opus list, and **real traffic is mixed-model.** The reference
+  machine here turned out to be 80.8% Opus 5, 7.6% Sonnet 5, 7.5% Opus 4.8 — so
+  even its own dollar column is an approximation, and a machine that is mostly
+  Sonnet is overstated considerably. The script now prints the model mix so you can
+  see how far off the basis is, and `--price-*` lets you correct it. **Every
+  percentage in this README survives a wrong price basis** — `cache_write /
+  cache_read` is 12.5 on every model tier, and both levers are ratios of cache
+  cost to total cost. Only the dollars move.
+- The reference figures are **one dated 30-day run**, not a live number. The window
+  rolls, so re-running tomorrow gives a different total. Percentages have been
+  stable across re-runs; dollars have not.
 
 ## What to send back
 
 The whole output. It is about 65 lines and contains nothing identifying beyond
-built-in tool names.
+built-in tool names, Claude Code versions, and model ids.
 
 ## License
 
