@@ -747,9 +747,12 @@ def main():
         print("  MCP                        %d server(s) configured, %d used, "
               "%d tool(s) called" % (len(servers), len(servers) - len(idle),
                                      len(unknown)))
+        # Deliberately a count, not the names. A server name can identify an
+        # internal system, and a "delete this before pasting" marker is not a
+        # control: the first person who hit one pasted it anyway.
         if idle:
-            print("  never used                 %s   <- delete this line before "
-                  "pasting" % ", ".join(idle))
+            print("  never used                 %d of those server(s), no tool "
+                  "called in %d days" % (len(idle), args.days))
     print()
     print("  Read from your transcripts: tool names, ids, timestamps, session")
     print("  ids, token counts. Never prompts, arguments, results or replies.")

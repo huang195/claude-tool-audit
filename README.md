@@ -123,9 +123,8 @@ reads local files, prints, and exits.
 
 The output is aggregate numbers and built-in tool names only — no paths, project
 names, branches, prompts, arguments, or MCP server names. Model Context Protocol
-tools are counted, never named, because a server name can identify an internal
-system. The one line that does name a server is marked for you to delete before
-sending.
+servers and tools are **counted, never named**, because a server name can identify
+an internal system. There is nothing in the output you need to redact.
 
 ## Options
 
