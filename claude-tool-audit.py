@@ -1,45 +1,29 @@
 #!/usr/bin/env python3
-"""Price three ways to cut your Claude Code bill without changing an answer.
+"""Price two ways to cut your Claude Code bill without changing an answer.
 
 WHY THIS EXISTS
 ---------------
-Measured over one developer's full 30-day history (56 sessions, 4,534 requests,
-1.12 B tokens, $1,097 at Opus list): **88% of the money went on writing and
-re-reading context that had already been sent.** New input was 1.3% of spend
-and output was 10.8%.
+Over one developer's 30-day history (56 lineages, 4,540 requests, 1.12 B tokens,
+$1,097 at Opus list) 88% of the money went on writing and re-reading context
+that had already been sent. New input was 1.3% of spend, output 10.8%.
 
-That means the big levers are not "say less" or "use a cheaper model" -- both of
-which cost you answer quality. The big levers are about not paying twice for
-the same bytes. This script prices three of them against YOUR history:
+So the levers that matter are not "say less" or "use a cheaper model" -- both of
+which cost answer quality. They are about not paying twice for the same bytes.
+This script prices two against YOUR history:
 
-  1. Dead tool schemas   -- tools declared on every request that you never call.
-                            Switch off today with a deny list. Measured 5.3%
-                            on the reference machine. FREE.
-  2. Cache expiry        -- after a 5-minute pause the prompt cache drops and the
-                            next request RE-WRITES the whole conversation at
-                            12.5x the price of re-reading it. Refreshing it
-                            first is byte-identical to the model. Measured
-                            +11.9 points. NEEDS A PROXY -- Claude Code has no
-                            way to refresh its own cache.
-  3. Unbatched tool calls-- most requests carry exactly one tool call, and every
-                            request re-reads the entire context. Batching
-                            independent calls removes whole round trips.
-                            Measured +7.8 points. A CLAUDE.md line. FREE.
+  A  Dead tool schemas -- declared on every request, never called. A static deny
+     list in settings.json is free and got 5.3% here. Doing it per developer,
+     from that developer's own call history, needs something in the request
+     path and got 7.7%.
+  B  Cache expiry -- after a 5-minute pause the prompt cache drops and the next
+     request RE-WRITES the whole conversation at 12.5x the price of re-reading
+     it. Refreshing first is byte-identical to the model. 12.9% here, and
+     impossible from inside Claude Code, which cannot refresh its own cache.
 
-None of the three changes the model, the context, or the information available
-to it. On the reference machine they compound to 25.0%.
-
-THE QUESTION THIS RUN IS MEANT TO ANSWER
-----------------------------------------
-Two of the three are free and need no infrastructure. Only lever 2 requires
-something sitting in the request path. So the number that decides whether such
-a thing is worth building is not the 25% -- it is what an in-path component
-adds for someone who has ALREADY taken the free wins. On the reference machine
-that is 11.9 points, and nearly all of it is lever 2.
-
-Run it, then send back the block printed by --report. Both halves matter: the
-free levers so you can act on them this week, and the in-path number so we can
-see how much it varies between people. That variance is the open question.
+Neither changes the model, the context, or the information available to it.
+Together, 18.8% -- or 11.9 points on top of the free static deny list, which is
+the number that decides whether anything is worth building. Send back the
+--report block so we can see how much that varies between people.
 
 WHAT IT READS
 -------------
@@ -51,31 +35,24 @@ WHAT IT SENDS
 -------------
 Nothing, ever, on its own. --measure makes exactly three `claude --print` calls
 with the fixed prompt "say ok" to weigh your real manifest. --apply only edits
-your local settings.json, after a backup. --report prints a block to your
-terminal for you to paste wherever you choose; it contains aggregate numbers and
-built-in tool names only -- no paths, project names, branches, or MCP server
-names.
+your local settings.json, after a backup. --report prints a block for you to
+paste wherever you choose: aggregate numbers and built-in tool names only, no
+paths, project names, branches, or MCP server names.
 
 USAGE
 -----
     python3 claude-tool-audit.py --report --measure   # <-- please run this one
-    python3 claude-tool-audit.py                  # the three levers, priced
-    python3 claude-tool-audit.py --report         # + a block to paste back
-    python3 claude-tool-audit.py --measure        # + weigh the manifest on the
-                                                  #   wire (3 "say ok" requests)
-    python3 claude-tool-audit.py --apply          # + turn off dead tools
-    python3 claude-tool-audit.py --verbose        # + every tool, + sensitivity
+    python3 claude-tool-audit.py --apply          # turn off the dead tools
+    python3 claude-tool-audit.py --verbose        # + per-tool detail
 
 CAVEATS, STATED UP FRONT
 ------------------------
-* Levers 2 and 3 are counterfactuals: they replay your real per-request token
-  counts under a different policy. They are arithmetic on measured data, not a
+* Both levers are counterfactuals: they replay your real per-request token
+  counts under a different policy. Arithmetic on measured data, not a
   simulation, but they assume the policy behaves as specified.
-* Lever 3 assumes the batched calls really are independent. Calls that must run
-  in sequence cannot be merged, so treat its number as an upper bound.
-* Lever 2 is priced with the adaptive rule (refresh only when refreshing is
-  cheaper than expiring). A blanket "always ping" policy LOSES money badly --
-  --verbose shows both, and the gap is 100x. Do not implement the blanket form.
+* B is priced with the adaptive rule (refresh only when refreshing is cheaper
+  than expiring). Blanket "always refresh" LOSES money badly -- the output
+  shows both, and the sign flips. Do not implement the blanket form.
 * "Never called" is not "never useful". A tool you have not needed yet may be
   the right tool next week. Every change is one line in settings.json to undo.
 * Per-tool token figures come from a wire capture of Claude Code 2.x and carry
@@ -518,26 +495,6 @@ def lever_refresh(rows, price, every=240.0, adaptive=True):
                         "refresh_tokens": ref_tokens}
 
 
-def batching_stats(msg_calls, msg_seen, target):
-    """Lever 3: how many whole round trips batching would remove.
-
-    Every request re-reads the entire context, whether it carries one tool call
-    or four. Total calls are fixed -- raising calls-per-request removes requests.
-    """
-    dist = collections.Counter()
-    for mid in msg_seen:
-        dist[msg_calls.get(mid, 0)] += 1
-    total_msgs = sum(dist.values())
-    total_calls = sum(k * v for k, v in dist.items())
-    bearing = sum(v for k, v in dist.items() if k > 0)
-    mean = total_calls / bearing if bearing else 0.0
-    removed = max(0.0, bearing - total_calls / target) if target > 0 else 0.0
-    return {"dist": dist, "messages": total_msgs, "calls": total_calls,
-            "bearing": bearing, "mean": mean, "removed": removed,
-            "cut": (removed / total_msgs) if total_msgs else 0.0,
-            "single_share": (dist.get(1, 0) / bearing) if bearing else 0.0}
-
-
 # ---------------------------------------------------------------------------
 # Phase 2 -- optional live measurement (2 API calls, no proxy needed)
 # ---------------------------------------------------------------------------
@@ -763,9 +720,6 @@ def main():
                     metavar="SECONDS",
                     help="lever 2: cache refresh interval, must be under the "
                          "300 s TTL (default 240)")
-    ap.add_argument("--batch-target", type=float, default=1.5,
-                    metavar="CALLS",
-                    help="lever 3: target tool calls per request (default 1.5)")
     for k in PRICE:
         ap.add_argument("--price-" + k.replace("_", "-"), type=float,
                         dest="price_" + k, default=PRICE[k],
@@ -884,8 +838,6 @@ def main():
     cost1 = cost_of(after1, price)
     after2, extra2, ref = lever_refresh(after1, price, args.refresh_every)
     cost2 = cost_of(after2, price, extra2)
-    bat = batching_stats(s["msg_calls"], s["msg_seen"], args.batch_target)
-    cost3 = cost_of(after2, price, extra2, read_scale=1 - bat["cut"])
 
     # --- the same levers, split by who can actually implement them ---------
     # Free: a deny list in settings.json, and a CLAUDE.md line. Needs nothing.
@@ -914,330 +866,153 @@ def main():
     context_share = sum(c for n, t, c in comp
                         if n in ("cache read", "cache write")) / baseline
 
-    # --- 1. the answer, before anything else ------------------------------
-    head("THE SHORT VERSION")
-    para("Over the last %d days you spent %s across %s requests (%s tokens), "
-         "priced at the rates below. %s of that went on writing and re-reading "
-         "context you had already sent -- not on new input, and not on output."
-         % (args.days, usd(baseline), num(s["turns"]),
-            num(sum(t for n, t, c in comp)), pct(context_share)))
+    # --- everything the reader needs, and nothing else --------------------
     print()
-    para("Three changes would recover %s (%s of the bill) WITHOUT changing the "
-         "model, shrinking the context, or hiding anything from it. The model "
-         "sees byte-identical prompts in every case."
-         % (usd(baseline - cost3), pct((baseline - cost3) / baseline)))
+    print("  %s   %s requests   %s tokens   %s cache lineages"
+          % (usd(baseline), num(s["turns"]), num(sum(t for n, t, c in comp)),
+             num(len(s["sessions"]))))
+    if s["first"] and s["last"]:
+        print("  %s to %s   Claude Code %s"
+              % (s["first"].date(), s["last"].date(),
+                 ", ".join(sorted(s["versions"])[-2:])))
     print()
-    print("    %-40s %9s %7s  %s" % ("cumulative", "cost", "saved", "needs"))
-    print("    %-40s %9s %7s  %s" % ("your last %d days" % args.days,
-                                     usd(baseline), "-", ""))
-    for label, c, who in (
-            ("+ 1. drop never-called tool schemas", cost1, "settings.json"),
-            ("+ 2. refresh cache before it expires", cost2, "a proxy"),
-            ("+ 3. batch tool calls (%.2f -> %.2f/req)"
-             % (bat["mean"], args.batch_target), cost3, "CLAUDE.md")):
-        print("    %-40s %9s %7s  %s" % (label, usd(c),
-                                         pct((baseline - c) / baseline), who))
-    print()
-    para("Levers 1 and 3 cost nothing and need no code: a deny list in "
-         "settings.json and one line in CLAUDE.md. Lever 2 cannot be done from "
-         "inside Claude Code at all -- it has no way to refresh its own cache -- "
-         "so it needs something sitting in the request path.")
-    print()
-    para("That split is the point of this run. Of the %s above, %s is free and "
-         "yours today; %s is the part that needs a proxy, and it is the biggest "
-         "single piece."
-         % (pct((baseline - cost3) / baseline),
-            pct((baseline - cost1 + cost2 - cost3) / baseline),
-            pct((cost1 - cost2) / baseline)))
-    print()
-    print("    %-40s %9s %7s" % ("what a proxy could do, standalone", "cost",
-                                 "saved"))
-    print("    %-40s %9s %7s" % ("  manifest trimmed per developer",
-                                 usd(cost_a), pct((baseline - cost_a) / baseline)))
-    print("    %-40s %9s %7s" % ("  + adaptive cache refresh", usd(cost_ab),
-                                 pct((baseline - cost_ab) / baseline)))
-    print("    %-40s %9s %7s" % ("  net of the BEST free deny list", "",
-                                 pct(incremental / baseline)))
-    print()
-    para("The last row is the honest number to judge a proxy on: what it adds "
-         "for someone who has already turned off every tool they can. Nearly "
-         "all of it is the cache refresh -- trimming the manifest dynamically "
-         "beats a static deny list by very little on built-ins alone. If MCP "
-         "servers are a big part of your context, that changes; run --measure "
-         "and we will know.")
-
-    # --- 2. where the money actually goes ---------------------------------
-    head("WHERE THE MONEY WENT")
-    para("A cache WRITE bills 12.5x a cache READ, so a high hit rate measured "
-         "in tokens can still leave writes as one of the largest line items. "
-         "That is why lever 2 exists.")
-    print()
-    print("    %-16s %14s %10s %7s" % ("", "tokens", "cost", "share"))
+    print("  %-16s %14s %10s %7s" % ("", "tokens", "cost", "share"))
     for n, t, c in comp:
-        print("    %-16s %14s %10s %6s"
+        print("  %-16s %14s %10s %6s"
               % (n, num(t), usd(c), pct(c / baseline)))
-
-    # --- 3. lever 1 -------------------------------------------------------
-    head("LEVER 1 -- TOOL SCHEMAS YOU NEVER CALL  (%s, switch on today)"
-         % pct((baseline - cost1) / baseline))
-    if not never:
-        para("Nothing to trim. You have actually used every tool Claude "
-             "declares to the model in the last %d days." % args.days)
-    else:
-        para("Claude Code re-sends the full description of every declared tool "
-             "on every request, called or not. %d of the %d built-in tools were "
-             "sent on all %s of your requests and never called once. Switching "
-             "one off removes its description from the wire -- it is not just "
-             "an execution block."
-             % (len(never), known, num(s["turns"])))
-        print()
-        para("Using the %s figure of %s tokens per request."
-             % (dead_source, num(dead_tokens)))
-        if safe_rows:
-            print()
-            table(safe_rows, per_tok, s["turns"])
-        if check_rows:
-            print()
-            para("A further %d are unused too, but removing one could break a "
-                 "workflow, so they are excluded from the total above. Pass "
-                 "--include-check-first to price them in (%s tokens)."
-                 % (len(check_rows), num(tot_check)))
-            if args.verbose:
-                print()
-                table(check_rows, per_tok, s["turns"])
-
-    # --- 4. lever 2 -------------------------------------------------------
-    head("LEVER 2 -- CACHE EXPIRY  (%s, needs a proxy)"
-         % pct((cost1 - cost2) / baseline))
-    para("The prompt cache lives %d seconds. Pause longer than that and the "
-         "next request RE-WRITES the whole conversation at %s/Mtok instead of "
-         "re-reading it at %s/Mtok. A refresh request re-reads the same bytes "
-         "and generates nothing, so the model's view is identical -- only the "
-         "price differs, by 12.5x."
-         % (TTL_SECONDS, usd(price["cache_write"]).lstrip("$"),
-            usd(price["cache_read"]).lstrip("$")))
     print()
+    print("  %s of the spend is context already sent, re-written or re-read."
+          % pct(context_share))
+
+    # --- the two levers ---------------------------------------------------
     cold_w = sum(r["w"] for r in rows if r["cold"] and r["prev"] > 0)
     all_w = sum(r["w"] for r in rows) or 1
-    print("    requests after an idle gap over %ds   %s of %s  (%s)"
-          % (TTL_SECONDS, num(ref["gaps"]), num(len(rows)),
-             pct(ref["gaps"] / len(rows))))
-    print("    their share of your cache-write tokens %19s"
-          % pct(cold_w / all_w))
-    print("    gaps where refreshing is the cheaper move %s of %s  (%s)"
-          % (num(ref["wins"]), num(ref["gaps"]),
-             pct(ref["wins"] / ref["gaps"]) if ref["gaps"] else "-"))
-    print("    refresh requests that would be added  %s"
-          % num(ref["refreshes"]))
-    w_after = sum(r["w"] for r in after2)
-    print("    your cache-write tokens                %s -> %s  (%+.0f%%)"
-          % (num(all_w), num(w_after), 100.0 * (w_after - all_w) / all_w))
+    head("TWO WAYS TO CUT IT, MODEL SEES BYTE-IDENTICAL PROMPTS")
+    print("  %-44s %9s %7s" % ("", "cost", "saved"))
+    print("  %-44s %9s %7s" % ("baseline", usd(baseline), "-"))
+    print("  %-44s %9s %7s" % ("A  never-called tools off, static deny list",
+                               usd(cost1), pct((baseline - cost1) / baseline)))
+    print("  %-44s %9s %7s" % ("A  same, but per developer and dynamic",
+                               usd(cost_a), pct((baseline - cost_a) / baseline)))
+    print("  %-44s %9s %7s" % ("B  refresh cache before it expires",
+                               usd(cost_b_only),
+                               pct((baseline - cost_b_only) / baseline)))
+    print("  %-44s %9s %7s" % ("A + B, both dynamic, in the request path",
+                               usd(cost_ab), pct((baseline - cost_ab) / baseline)))
+    print("  %-44s %9s %7s" % ("A + B, net of the best free deny list", "",
+                               pct(incremental / baseline)))
     print()
-    para("Breakeven is cache_write/cache_read = %.1f refreshes, roughly %d "
-         "minutes of idle. Past that, letting the cache expire is genuinely "
-         "cheaper -- so the policy has to decide per gap. That is the whole "
-         "design, and it is why %s of your gaps are left to expire."
-         % (price["cache_write"] / price["cache_read"],
-            round(price["cache_write"] / price["cache_read"]
-                  * args.refresh_every / 60),
-            pct(1 - (ref["wins"] / ref["gaps"] if ref["gaps"] else 0))))
-    if args.verbose:
-        print()
-        para("Sensitivity -- adaptive (decide per gap) against blanket (refresh "
-             "every gap regardless). This lever's own contribution, at five "
-             "intervals. Adaptive wins at all of them; blanket is a disaster at "
-             "all of them. This is the one thing not to get wrong:")
-        print()
-        print("      %-12s %12s %12s" % ("interval", "adaptive", "blanket"))
-        for every in (120.0, 180.0, 240.0, 270.0, 290.0):
-            ra, ea, _ = lever_refresh(after1, price, every, True)
-            rb, eb, _ = lever_refresh(after1, price, every, False)
-            ca, cb = cost_of(ra, price, ea), cost_of(rb, price, eb)
-            print("      %-12s %11s %12s"
-                  % ("%.0f s" % every,
-                     "%+.1f%%" % (100.0 * (cost1 - ca) / baseline),
-                     "%+.1f%%" % (100.0 * (cost1 - cb) / baseline)))
+    print("  A is free and static in settings.json; dynamic A and all of B need")
+    print("  something in the request path. The last row is what that adds for")
+    print("  someone who already turned off every tool they can.")
 
-    # --- 5. lever 3 -------------------------------------------------------
-    head("LEVER 3 -- ONE TOOL CALL PER REQUEST  (%s, a CLAUDE.md line)"
-         % pct((cost2 - cost3) / baseline))
-    para("Every request re-reads your entire context, whether it carries one "
-         "tool call or four. You are at %.2f calls per tool-bearing request, "
-         "and %s of them carry exactly one. Batching independent calls removes "
-         "whole round trips -- same work, same results, less waiting."
-         % (bat["mean"], pct(bat["single_share"])))
-    print()
-    print("    %-16s %9s %8s" % ("calls in request", "count", "share"))
-    for k in sorted(bat["dist"]):
-        if k > 8:
-            continue
-        print("    %-16s %9s %7s" % (k, num(bat["dist"][k]),
-                                     pct(bat["dist"][k] / (bat["messages"] or 1))))
-    print()
-    print("    %-24s %10s %10s" % ("target calls/request", "requests cut",
-                                   "of all"))
-    for t in (1.5, 2.0, 2.5):
-        b = batching_stats(s["msg_calls"], s["msg_seen"], t)
-        print("    %-24s %10s %9s" % ("%.1f" % t, num(b["removed"]),
-                                      pct(b["cut"])))
-    print()
-    para("Priced by removing those requests' context re-reads only. Their "
-         "output still happens -- the same tool calls are still made -- so this "
-         "is the conservative half of the effect. It also assumes the batched "
-         "calls are genuinely independent, which makes it an upper bound.")
+    # --- lever A facts ----------------------------------------------------
+    head("A -- TOOL SCHEMAS SENT ON EVERY REQUEST, NEVER CALLED")
+    pool_names = {n for n, v in TOOLS.items()
+                  if v[2] != "interactive" and v[0] > 0}
+    print("  %d of %d schemas never called, %s tokens/request (%s)"
+          % (len(never), len(pool_names), num(dead_tokens), dead_source))
+    if low:
+        print(textwrap.fill(" ".join(sorted(low)), width=WIDTH,
+                            initial_indent="    ", subsequent_indent="    "))
+    if check:
+        print("  %d more unused, but dropping one could break a workflow "
+              "(%s tokens):" % (len(check), num(tot_check)))
+        print(textwrap.fill(" ".join(sorted(check)), width=WIDTH,
+                            initial_indent="    ", subsequent_indent="    "))
+    print("  dynamic ceiling if every lineage were trimmed perfectly: %s"
+          % pct((baseline - dyn["oracle"]) / baseline))
+    print("  lineages that reach a usable trim point: %d of %d"
+          % (dyn["reached"], dyn["lineages"]))
 
-    # --- 6. your history --------------------------------------------------
-    head("WHAT YOUR HISTORY SHOWS")
-    if s["first"] and s["last"]:
-        print("  period       %s to %s" % (s["first"].date(), s["last"].date()))
-    print("  requests     %s across %s cache lineages"
-          % (num(s["turns"]), num(len(s["sessions"]))))
-    print("  tool calls   %s  across %d different tools"
+    # --- lever B facts ----------------------------------------------------
+    head("B -- CACHE EXPIRY  (%ds TTL, write bills %.1fx read)"
+         % (TTL_SECONDS, price["cache_write"] / price["cache_read"]))
+    print("  requests after an idle gap    %s of %s (%s)"
+          % (num(ref["gaps"]), num(len(rows)), pct(ref["gaps"] / len(rows))))
+    print("  their share of cache writes   %s" % pct(cold_w / all_w))
+    print("  gaps cheaper to refresh       %s of %s"
+          % (num(ref["wins"]), num(ref["gaps"])))
+    print("  refresh requests added        %s" % num(ref["refreshes"]))
+    print()
+    print("  %-10s %10s %10s" % ("interval", "adaptive", "blanket"))
+    sweep = {}
+    for every in (120.0, 180.0, 240.0, 270.0, 290.0):
+        ra, ea, _ = lever_refresh(rows, price, every, True)
+        rb, eb, _ = lever_refresh(rows, price, every, False)
+        ca, cb = cost_of(ra, price, ea), cost_of(rb, price, eb)
+        sweep[int(every)] = {
+            "adaptive_pct": round(100.0 * (baseline - ca) / baseline, 1),
+            "blanket_pct": round(100.0 * (baseline - cb) / baseline, 1)}
+        print("  %-10s %9s %10s"
+              % ("%.0f s" % every,
+                 "%+.1f%%" % sweep[int(every)]["adaptive_pct"],
+                 "%+.1f%%" % sweep[int(every)]["blanket_pct"]))
+    print()
+    print("  adaptive = refresh a gap only when that is cheaper than letting it")
+    print("  expire. blanket = refresh always. Getting this wrong inverts it.")
+
+    # --- profile ----------------------------------------------------------
+    lc = lineage_costs(s["sessions"], price)
+    ctx_tok = [r["i"] + r["w"] + r["r"] for r in rows]
+    mean_ctx = sum(ctx_tok) // len(ctx_tok) if ctx_tok else 0
+    head("YOUR SHAPE")
+    print("  mean context per request   %s tokens" % num(mean_ctx))
+    print("  manifest share of that     %s"
+          % pct(dyn["pool_tokens"] / mean_ctx if mean_ctx else 0))
+    if len(lc) > 3:
+        print("  spend concentration        top 1 of %d %s, top 4 %s, "
+              "median %s" % (len(lc), pct(lc[0] / baseline),
+                             pct(sum(lc[:4]) / baseline),
+                             usd(lc[len(lc) // 2])))
+    print("  tool calls                 %s across %d tools"
           % (num(s["calls"]), len(called)))
-    top = called.most_common(None if args.verbose else 6)
-    if top:
-        print(textwrap.fill(
-            ", ".join("%s %s" % (n, num(c)) for n, c in top),
-            width=WIDTH, initial_indent="  most used    ",
-            subsequent_indent=" " * 15))
-    if not args.verbose and len(called) > len(top):
-        print("               ...and %d more (--verbose for all of them)"
-              % (len(called) - len(top)))
-    if s["versions"]:
-        print("  Claude Code  %s" % ", ".join(sorted(s["versions"])[-3:]))
-
-    sess_costs = sorted((cost_of(x, price) for x in s["sessions"]),
-                        reverse=True)
-    if len(sess_costs) > 3:
-        print()
-        para("Spend concentration -- long sessions are the whole bill, so none "
-             "of this needs to change how you work day to day:")
-        for k in (1, 4, 8):
-            if k <= len(sess_costs):
-                run = sum(sess_costs[:k])
-                print("    %-22s %10s  %s of your spend"
-                      % ("top %d of %d" % (k, len(sess_costs)),
-                         usd(run), pct(run / baseline)))
-        mid = sess_costs[len(sess_costs) // 2]
-        print("    %-22s %10s" % ("median lineage", usd(mid)))
 
     unknown = sorted(n for n in called if n not in TOOLS)
-    if unknown:
-        print()
-        para("%d tool(s) you called are not in this script's size table, so "
-             "they are neither priced nor ever proposed for removal. That "
-             "normally means an MCP tool, or a newer Claude Code than the one "
-             "this table was measured on:" % len(unknown))
-        for n in unknown:
-            # MCP tool names embed the server name, which can name an internal
-            # system. Shown masked, because this output gets pasted around.
-            print("    %s" % (("mcp__<server>__%s" % n.split("__")[-1])
-                              if n.startswith("mcp__") else n))
-
-    # --- 7. MCP servers ---------------------------------------------------
     servers = configured_mcp_servers()
     used = {n.split("__")[1] for n in called if n.startswith("mcp__")
             and len(n.split("__")) > 2}
     idle = sorted(servers - used)
-    if servers:
-        head("MCP SERVERS -- %d configured, %d used in this window"
-             % (len(servers), len(servers) - len(idle)))
-        if idle:
-            para("No calls at all from: %s   <-- the only line in this whole "
-                 "output that names anything of yours. Delete it before you "
-                 "paste; the counts are already in the report block."
-                 % ", ".join(idle))
-            print()
-            para("MCP tool descriptions are often the largest part of a request "
-                 "and are NOT in any total above. Dropping a server you never "
-                 "use is usually the single biggest win available. Remove it "
-                 "from your config, or start a session with --strict-mcp-config "
-                 "to leave all of them out. Pass --measure to see what they "
-                 "weigh on your wire.")
+    if servers or unknown:
+        print("  MCP                        %d server(s) configured, %d used, "
+              "%d tool(s) called" % (len(servers), len(servers) - len(idle),
+                                     len(unknown)))
+        if mcp_tokens is not None:
+            print("  MCP schemas on the wire    %s tokens/request (%s)"
+                  % (num(mcp_tokens),
+                     pct(mcp_tokens / wire_manifest if wire_manifest else 0)))
         else:
-            para("All of them saw calls, so there is nothing to trim here. MCP "
-                 "tool descriptions are not counted in any total above; pass "
-                 "--measure to see what they weigh on your wire.")
-
-    # --- 8. how the numbers were made ------------------------------------
-    head("HOW THESE NUMBERS WERE MADE")
-    para("Levers 2 and 3 replay your real per-request token counts under a "
-         "different policy. That is arithmetic on measured data, not a "
-         "simulation -- but it assumes the policy behaves as described.")
-    if shares:
-        print()
-        para("Your input tokens split %s uncached, %s written to cache, %s read "
-             "back from cache. Prices default to Anthropic list; if you bill "
-             "through a discounted gateway pass --price-input, --price-output, "
-             "--price-cache-write and --price-cache-read, and every number "
-             "above rescales." % tuple(pct(x) for x in shares))
+            print("  MCP schemas on the wire    unknown -- pass --measure; "
+                  "transcripts cannot show it")
+        if idle:
+            print("  never used                 %s   <- delete this line before "
+                  "pasting" % ", ".join(idle))
     print()
-    para("Cache lineages are keyed on session id and on whether the request "
-         "belonged to a subagent, because a subagent runs on its own prompt "
-         "prefix and can never warm the main conversation's cache. Merging "
-         "them would hide idle gaps and understate lever 2.")
-    print()
-    para("What this script read from your transcripts: tool names, ids, "
-         "timestamps, session ids and token counts. Never prompts, arguments, "
-         "results or replies. Nothing is sent anywhere unless you pass "
-         "--measure.")
+    print("  Read from your transcripts: tool names, ids, timestamps, session")
+    print("  ids, token counts. Never prompts, arguments, results or replies.")
+    print("  Nothing leaves your machine unless you pass --measure.")
 
     # --- 9. the paste-able block ------------------------------------------
+    # --- the paste-able block ---------------------------------------------
     if args.report:
         head("PASTE THIS BACK")
-        para("Aggregate numbers and built-in tool names only. No paths, project "
-             "names, branches, prompts, tool arguments, or MCP server names. "
-             "Read it before you send it -- it is all on screen, and it is the "
-             "only thing anyone needs from you.")
-        print()
-        para("Four fields are worth a word. `in_path` is what only a proxy can "
-             "do and `free_no_code` is what you can do today, so the comparison "
-             "between them is the decision. `refresh_sensitivity` shows adaptive "
-             "refresh (refresh a gap only when that is cheaper than letting it "
-             "expire) against blanket refresh (refresh always) -- if blanket is "
-             "negative for you too, the adaptive part is the whole trick. "
-             "`profile.top4_lineages_pct` says whether your spend is "
-             "concentrated in a few long sessions, which is where refresh pays. "
-             "`mcp.schema_tokens` is null unless you pass --measure; it is the "
-             "one number transcripts cannot give.")
-        print()
-        para("If you can spare 30 seconds, re-run as `--report --measure`. It "
-             "sends three throwaway \"say ok\" requests and fills in what your "
-             "tool schemas actually weigh on the wire.")
+        print("  Aggregate numbers and built-in tool names only. No paths,")
+        print("  project names, branches, prompts, arguments, or MCP server")
+        print("  names. Please run it as `--report --measure` if you can.")
         print()
 
-        def p(x):                      # share of the baseline, one decimal
+        def p(x):
             return round(100.0 * x / baseline, 1) if baseline else None
 
-        lc = lineage_costs(s["sessions"], price)
-        ctx_tok = [r["i"] + r["w"] + r["r"] for r in rows]
-        mean_ctx = sum(ctx_tok) / len(ctx_tok) if ctx_tok else 0
-        pool_names = {n for n, v in TOOLS.items()
-                      if v[2] != "interactive" and v[0] > 0}
-        mcp_called = sorted(n for n in called if n.startswith("mcp__"))
-
-        sens = {}
-        for every in (120.0, 180.0, 240.0, 270.0, 290.0):
-            ra, ea, _ = lever_refresh(rows, price, every, True)
-            rb, eb, _ = lever_refresh(rows, price, every, False)
-            sens[int(every)] = {
-                "adaptive_pct": p(baseline - cost_of(ra, price, ea)),
-                "blanket_pct": p(baseline - cost_of(rb, price, eb)),
-            }
-
         blob = {
-            "schema": "claude-cost-audit/3",
-            "window": {
-                "days": args.days,
-                "from": s["first"].date().isoformat() if s["first"] else None,
-                "to": s["last"].date().isoformat() if s["last"] else None,
-                "requests": s["turns"],
-                "cache_lineages": len(s["sessions"]),
-                "tool_calls": s["calls"],
-                "distinct_tools": len(called),
-                "claude_code": sorted(s["versions"])[-3:],
-            },
-            "spend_usd": {
+            "schema": "claude-cost-audit/4",
+            "days": args.days,
+            "to": s["last"].date().isoformat() if s["last"] else None,
+            "claude_code": sorted(s["versions"])[-1:],
+            "requests": s["turns"],
+            "lineages": len(s["sessions"]),
+            "tool_calls": s["calls"],
+            "usd": {
                 "total": round(baseline, 2),
                 "cache_read": round(next(c for n, t, c in comp
                                          if n == "cache read"), 2),
@@ -1245,75 +1020,49 @@ def main():
                                           if n == "cache write"), 2),
                 "output": round(next(c for n, t, c in comp
                                      if n == "output"), 2),
-                "input_uncached": round(next(c for n, t, c in comp
-                                             if n == "uncached input"), 2),
-                "context_share_pct": round(100.0 * context_share, 1),
+                "input": round(next(c for n, t, c in comp
+                                    if n == "uncached input"), 2),
             },
             "tokens": {k: u[k] for k in sorted(u)},
-            "profile": {
-                "mean_context_tokens": int(mean_ctx),
-                "median_lineage_usd": round(lc[len(lc) // 2], 2) if lc else 0,
+            "saved_pct": {
+                "a_static_free": p(baseline - cost1),
+                "a_static_free_aggressive": p(baseline - cost_free_static),
+                "a_dynamic": p(baseline - cost_a),
+                "a_dynamic_ceiling": p(baseline - dyn["oracle"]),
+                "b_refresh": p(baseline - cost_b_only),
+                "a_and_b": p(baseline - cost_ab),
+                "a_and_b_net_of_free": p(incremental),
+            },
+            "refresh_sweep_pct": sweep,
+            "shape": {
+                "mean_context_tokens": mean_ctx,
+                "manifest_tokens": dyn["pool_tokens"],
+                "manifest_share_pct": round(
+                    100.0 * dyn["pool_tokens"] / mean_ctx, 1) if mean_ctx else None,
+                "cold_starts": ref["gaps"],
+                "cold_start_pct": round(100.0 * ref["gaps"] / s["turns"], 1)
+                                  if s["turns"] else None,
+                "cold_start_write_share_pct": round(100.0 * cold_w / all_w, 1),
+                "gaps_worth_refreshing": ref["wins"],
                 "top1_lineage_pct": p(lc[0]) if lc else None,
                 "top4_lineages_pct": p(sum(lc[:4])) if lc else None,
-                "idle_gap_cold_starts": ref["gaps"],
-                "idle_gap_cold_start_pct": round(
-                    100.0 * ref["gaps"] / s["turns"], 1) if s["turns"] else None,
-                "cold_start_write_share_pct": round(100.0 * cold_w / all_w, 1),
+                "trimmable_lineages": [dyn["reached"], dyn["lineages"]],
             },
-            # ---- what needs something in the request path -------------------
-            "in_path": {
-                "plugin_a_strip_dynamic_pct": p(baseline - cost_a),
-                "plugin_a_oracle_ceiling_pct": p(baseline - dyn["oracle"]),
-                "plugin_b_refresh_alone_pct": p(baseline - cost_b_only),
-                "both_plugins_pct": p(baseline - cost_ab),
-                "incremental_over_free_deny_list_pct": p(incremental),
-                "incremental_usd": round(incremental, 2),
-                "lineages_reaching_cold_start": dyn["reached"],
-                "lineages_total": dyn["lineages"],
-                "naive_mid_prefix_rewrite_usd": round(dyn["naive_rewrite"], 2),
-                "gaps_worth_refreshing": ref["wins"],
-                "gaps_seen": ref["gaps"],
-                "refresh_requests": ref["refreshes"],
-                "refresh_interval_s": args.refresh_every,
-            },
-            "refresh_sensitivity": sens,
-            # ---- what anyone can do today, with no code ---------------------
-            "free_no_code": {
-                "static_deny_conservative_pct": p(baseline - cost1),
-                "static_deny_aggressive_pct": p(baseline - cost_free_static),
-                "batching_pct": p(cost2 - cost3),
-                "calls_per_request": round(bat["mean"], 3),
-                "single_call_share_pct": round(100.0 * bat["single_share"], 1),
-                "batch_target_used": args.batch_target,
-            },
-            "three_lever_stack_pct": p(baseline - cost3),
             "manifest": {
-                "priced_tools": dyn["pool_tools"],
-                "priced_tokens": dyn["pool_tokens"],
-                "share_of_mean_context_pct": round(
-                    100.0 * dyn["pool_tokens"] / mean_ctx, 1) if mean_ctx else None,
-                "priced_tools_ever_called": len(pool_names & set(called)),
+                "dead_tokens": int(dead_tokens),
+                "source": dead_source,
+                "wire_total_tokens": wire_manifest,
+                "tools_priced": dyn["pool_tools"],
+                "tools_called": len(pool_names & set(called)),
                 "never_called": sorted(low),
-                "never_called_check_first": sorted(check),
-                "dead_tokens_used": int(dead_tokens),
-                "dead_tokens_source": dead_source,
+                "never_called_risky": sorted(check),
             },
-            # ---- the one quantity nothing else reports ----------------------
             "mcp": {
-                "servers_configured": len(servers),
-                "servers_never_used": len(idle) if servers else 0,
-                "tools_called": len(mcp_called),
-                "tools_unpriced_by_this_script": len(unknown),
+                "servers": len(servers),
+                "servers_unused": len(idle),
+                "tools_called": len(unknown),
                 "schema_tokens": mcp_tokens,
-                "schema_share_of_request_pct": (
-                    round(100.0 * mcp_tokens / wire_manifest, 1)
-                    if mcp_tokens and wire_manifest else None),
-                "names_withheld": True,
-                "note": ("measured on the wire" if mcp_tokens is not None else
-                         "re-run with --measure to fill schema_tokens; it is "
-                         "the only number here transcripts cannot give"),
             },
-            "wire_manifest_tokens_measured": wire_manifest,
             "prices_usd_per_mtok": price,
         }
         for ln in json.dumps(blob, indent=2, sort_keys=True).splitlines():
@@ -1325,17 +1074,13 @@ def main():
         return 0
 
     if not args.apply:
-        head("TO TURN OFF THE DEAD TOOLS (LEVER 1)")
-        print("    python3 %s --apply" % os.path.basename(sys.argv[0]))
-        print()
-        para("That shows you the change, asks, backs up your settings and "
-             "touches nothing else. Or merge this into "
-             "~/.claude/settings.json yourself:")
-        print()
-        snippet = json.dumps({"permissions": {"deny": sorted(candidates)}},
-                             indent=2)
-        for ln in snippet.splitlines():
-            print("    " + ln)
+        head("TO TAKE LEVER A NOW (FREE, REVERSIBLE)")
+        print("  python3 %s --apply" % os.path.basename(sys.argv[0]))
+        print("  Shows the change, asks, backs up settings.json. Or paste this")
+        print("  into ~/.claude/settings.json under permissions.deny:")
+        print(textwrap.fill(", ".join('"%s"' % n for n in sorted(candidates)),
+                            width=WIDTH, initial_indent="    ",
+                            subsequent_indent="    "))
         print()
         return 0
 
