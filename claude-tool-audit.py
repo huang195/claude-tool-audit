@@ -11,19 +11,17 @@ So the levers that matter are not "say less" or "use a cheaper model" -- both of
 which cost answer quality. They are about not paying twice for the same bytes.
 This script prices two against YOUR history:
 
-  A  Dead tool schemas -- declared on every request, never called. A static deny
-     list in settings.json is free and got 5.3% here. Doing it per developer,
-     from that developer's own call history, needs something in the request
-     path and got 7.7%.
+  A  Dead tool schemas -- declared on every request, never called. Rewriting the
+     tools array per developer, from that developer's own call history, needs
+     something in the request path. 7.6% here.
   B  Cache expiry -- after a 5-minute pause the prompt cache drops and the next
      request RE-WRITES the whole conversation at 12.5x the price of re-reading
-     it. Refreshing first is byte-identical to the model. 12.9% here, and
+     it. Refreshing first is byte-identical to the model. 12.6% here, and
      impossible from inside Claude Code, which cannot refresh its own cache.
 
 Neither changes the model, the context, or the information available to it.
-Together, 18.8% -- or 11.9 points on top of the free static deny list, which is
-the number that decides whether anything is worth building. Send back the
---report block so we can see how much that varies between people.
+Together, 18.4% here. Send back the --report block so we can see how much that
+varies between people -- that is what decides whether it is worth building.
 
 WHAT IT READS
 -------------
@@ -34,15 +32,14 @@ counts. It never reads prompts, tool arguments, tool results, or completions.
 WHAT IT SENDS
 -------------
 Nothing, ever, on its own. --measure makes exactly three `claude --print` calls
-with the fixed prompt "say ok" to weigh your real manifest. --apply only edits
-your local settings.json, after a backup. --report prints a block for you to
-paste wherever you choose: aggregate numbers and built-in tool names only, no
-paths, project names, branches, or MCP server names.
+with the fixed prompt "say ok" to weigh your real manifest. --report prints a
+block for you to paste wherever you choose: aggregate numbers and built-in tool
+names only, no paths, project names, branches, or MCP server names. The script
+changes no files and no settings.
 
 USAGE
 -----
     python3 claude-tool-audit.py --report --measure   # <-- please run this one
-    python3 claude-tool-audit.py --apply          # turn off the dead tools
     python3 claude-tool-audit.py --verbose        # + per-tool detail
 
 CAVEATS, STATED UP FRONT
@@ -54,7 +51,7 @@ CAVEATS, STATED UP FRONT
   than expiring). Blanket "always refresh" LOSES money badly -- the output
   shows both, and the sign flips. Do not implement the blanket form.
 * "Never called" is not "never useful". A tool you have not needed yet may be
-  the right tool next week. Every change is one line in settings.json to undo.
+  the right tool next week, so A has to be able to put it back.
 * Per-tool token figures come from a wire capture of Claude Code 2.x and carry
   roughly +/-15%. The aggregate is the solid number, and --measure replaces the
   estimate with a direct measurement on your machine.
@@ -67,7 +64,6 @@ import glob
 import json
 import math
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -555,78 +551,6 @@ def measure(deny, mcp=False):
 # Phase 3 -- settings edit
 # ---------------------------------------------------------------------------
 
-def settings_path(explicit):
-    return explicit or os.path.expanduser("~/.claude/settings.json")
-
-
-def apply_deny(path, names, assume_yes):
-    """Add names to permissions.deny. Backs up first, touches nothing else."""
-    try:
-        with open(path) as fh:
-            cfg = json.load(fh)
-    except FileNotFoundError:
-        cfg = {}
-    except (OSError, ValueError) as exc:
-        print("  cannot read %s: %s" % (path, exc))
-        return False
-    if not isinstance(cfg, dict):
-        print("  %s is not a JSON object; refusing to edit" % path)
-        return False
-
-    perms = cfg.setdefault("permissions", {})
-    if not isinstance(perms, dict):
-        print("  permissions is not an object; refusing to edit")
-        return False
-    deny = perms.setdefault("deny", [])
-    if not isinstance(deny, list):
-        print("  permissions.deny is not a list; refusing to edit")
-        return False
-
-    additions = [n for n in sorted(names) if n not in deny]
-    if not additions:
-        print("\n  These are already in permissions.deny. Nothing to do.")
-        return False
-
-    print("\n  Editing %s" % path)
-    print("  Adding to permissions.deny, and changing nothing else:")
-    for n in additions:
-        print("    + %s" % n)
-    if not assume_yes:
-        if not sys.stdin.isatty():
-            print("\n  Not running in a terminal, so there is nobody to ask.")
-            print("  Re-run interactively, or pass --yes to skip the prompt.")
-            return False
-        if input("\n  Go ahead? [y/N] ").strip().lower() not in ("y", "yes"):
-            print("  Left your settings alone.")
-            return False
-
-    backup = None
-    if os.path.exists(path):
-        backup = path + ".bak"
-        shutil.copy2(path, backup)
-    else:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-
-    deny.extend(additions)
-    tmp = path + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(cfg, fh, indent=2)
-        fh.write("\n")
-    os.replace(tmp, path)
-
-    print("\n  Done -- %d tool(s) turned off. Takes effect in new sessions."
-          % len(additions))
-    if backup:
-        print("  Your previous settings: %s" % backup)
-        print("  To undo everything:     mv %s %s" % (backup, path))
-    print("  To undo one tool, delete its name from permissions.deny.")
-    return True
-
-
-# ---------------------------------------------------------------------------
-# MCP servers -- names only, never values
-# ---------------------------------------------------------------------------
-
 def configured_mcp_servers():
     names = set()
     for p in (os.path.expanduser("~/.claude.json"),
@@ -707,15 +631,10 @@ def main():
                     help="print a paste-able summary block (aggregates only)")
     ap.add_argument("--measure", action="store_true",
                     help="verify lever 1 with 2 `claude --print` calls")
-    ap.add_argument("--apply", action="store_true",
-                    help="prompt to add never-used tools to permissions.deny")
-    ap.add_argument("--yes", action="store_true",
-                    help="with --apply, skip the confirmation prompt")
     ap.add_argument("--include-check-first", action="store_true",
                     help="also offer the tools flagged check-first")
     ap.add_argument("--verbose", action="store_true",
                     help="every tool you called, plus lever-2 sensitivity")
-    ap.add_argument("--settings", help="settings.json to edit (default ~/.claude)")
     ap.add_argument("--refresh-every", type=float, default=240.0,
                     metavar="SECONDS",
                     help="lever 2: cache refresh interval, must be under the "
@@ -812,9 +731,9 @@ def main():
                 print("                       %8.1f%% of that request"
                       % (100.0 * mcp_tokens / base_tok if base_tok else 0))
                 print()
-                para("That MCP figure is the number this analysis could not get "
-                     "any other way. A static deny list cannot reach it; only "
-                     "something in the request path can. Please include it.")
+                para("That MCP figure is the one number the transcripts cannot "
+                     "show, so it only exists if you run --measure. Please "
+                     "include it.")
             elif args.measure:
                 print()
                 para("MCP size unavailable -- your Claude Code may predate "
@@ -832,29 +751,21 @@ def main():
     dead_tokens = measured if measured else tot_offered
     dead_source = "measured" if measured else "estimated"
 
-    # --- the three levers, applied cumulatively ---------------------------
+    # --- the two levers, both in the request path -------------------------
+    # A: rewrite the tools array per developer, from that developer's own call
+    # history. B: refresh a cache lineage's prefix before its TTL expires.
+    # Neither is reachable from inside Claude Code.
     baseline = cost_of(rows, price)
-    after1 = lever_tools(rows, dead_tokens)
-    cost1 = cost_of(after1, price)
-    after2, extra2, ref = lever_refresh(after1, price, args.refresh_every)
-    cost2 = cost_of(after2, price, extra2)
-
-    # --- the same levers, split by who can actually implement them ---------
-    # Free: a deny list in settings.json, and a CLAUDE.md line. Needs nothing.
-    # In-path: per-lineage stripping and per-session refresh. Needs a proxy.
-    agg_dead = sum(tokens_of(n) for n in low + check)
-    cost_free_static = cost_of(lever_tools(rows, agg_dead), price)
 
     dyn = strip_dynamic(s["sessions"], price)
     cost_a = dyn["cold"]
-    after_b, extra_b, ref_b = lever_refresh(dyn["cold_rows"], price,
-                                            args.refresh_every)
+    after_b, extra_b, _ = lever_refresh(dyn["cold_rows"], price,
+                                        args.refresh_every)
     cost_ab = cost_of(after_b, price, extra_b)
-    # Plugin B on its own, against the untouched baseline.
-    solo_b, extra_sb, _ = lever_refresh(rows, price, args.refresh_every)
+    # B on its own, against the untouched baseline, so the two are comparable.
+    # `ref` comes from this one: the gap statistics describe the real history.
+    solo_b, extra_sb, ref = lever_refresh(rows, price, args.refresh_every)
     cost_b_only = cost_of(solo_b, price, extra_sb)
-    # What an in-path component adds for someone who already took the free wins.
-    incremental = cost_free_static - cost_ab
 
     u = s["usage"]
     comp = [("cache read", u["cache_read_input_tokens"], price["cache_read"]),
@@ -887,24 +798,19 @@ def main():
     # --- the two levers ---------------------------------------------------
     cold_w = sum(r["w"] for r in rows if r["cold"] and r["prev"] > 0)
     all_w = sum(r["w"] for r in rows) or 1
-    head("TWO WAYS TO CUT IT, MODEL SEES BYTE-IDENTICAL PROMPTS")
+    head("WHAT AN IN-PATH PROXY SAVES, MODEL SEES BYTE-IDENTICAL PROMPTS")
     print("  %-44s %9s %7s" % ("", "cost", "saved"))
     print("  %-44s %9s %7s" % ("baseline", usd(baseline), "-"))
-    print("  %-44s %9s %7s" % ("A  never-called tools off, static deny list",
-                               usd(cost1), pct((baseline - cost1) / baseline)))
-    print("  %-44s %9s %7s" % ("A  same, but per developer and dynamic",
+    print("  %-44s %9s %7s" % ("A  drop schemas this developer never calls",
                                usd(cost_a), pct((baseline - cost_a) / baseline)))
-    print("  %-44s %9s %7s" % ("B  refresh cache before it expires",
+    print("  %-44s %9s %7s" % ("B  refresh the cache before it expires",
                                usd(cost_b_only),
                                pct((baseline - cost_b_only) / baseline)))
-    print("  %-44s %9s %7s" % ("A + B, both dynamic, in the request path",
-                               usd(cost_ab), pct((baseline - cost_ab) / baseline)))
-    print("  %-44s %9s %7s" % ("A + B, net of the best free deny list", "",
-                               pct(incremental / baseline)))
+    print("  %-44s %9s %7s" % ("A + B", usd(cost_ab),
+                               pct((baseline - cost_ab) / baseline)))
     print()
-    print("  A is free and static in settings.json; dynamic A and all of B need")
-    print("  something in the request path. The last row is what that adds for")
-    print("  someone who already turned off every tool they can.")
+    print("  Neither is reachable from inside Claude Code: it cannot see one")
+    print("  developer's call history, and it cannot refresh its own cache.")
 
     # --- lever A facts ----------------------------------------------------
     head("A -- TOOL SCHEMAS SENT ON EVERY REQUEST, NEVER CALLED")
@@ -916,11 +822,12 @@ def main():
         print(textwrap.fill(" ".join(sorted(low)), width=WIDTH,
                             initial_indent="    ", subsequent_indent="    "))
     if check:
-        print("  %d more unused, but dropping one could break a workflow "
-              "(%s tokens):" % (len(check), num(tot_check)))
+        print("  %d more never called, but each partners a tool in use, so A"
+              % len(check))
+        print("  keeps them (%s tokens):" % num(tot_check))
         print(textwrap.fill(" ".join(sorted(check)), width=WIDTH,
                             initial_indent="    ", subsequent_indent="    "))
-    print("  dynamic ceiling if every lineage were trimmed perfectly: %s"
+    print("  ceiling if every lineage were trimmed perfectly: %s"
           % pct((baseline - dyn["oracle"]) / baseline))
     print("  lineages that reach a usable trim point: %d of %d"
           % (dyn["reached"], dyn["lineages"]))
@@ -1025,13 +932,10 @@ def main():
             },
             "tokens": {k: u[k] for k in sorted(u)},
             "saved_pct": {
-                "a_static_free": p(baseline - cost1),
-                "a_static_free_aggressive": p(baseline - cost_free_static),
                 "a_dynamic": p(baseline - cost_a),
                 "a_dynamic_ceiling": p(baseline - dyn["oracle"]),
                 "b_refresh": p(baseline - cost_b_only),
                 "a_and_b": p(baseline - cost_ab),
-                "a_and_b_net_of_free": p(incremental),
             },
             "refresh_sweep_pct": sweep,
             "shape": {
@@ -1068,33 +972,9 @@ def main():
         for ln in json.dumps(blob, indent=2, sort_keys=True).splitlines():
             print("  " + ln)
 
-    # --- 10. act ----------------------------------------------------------
-    if not candidates:
-        print()
-        return 0
-
-    if not args.apply:
-        head("TO TAKE LEVER A NOW (FREE, REVERSIBLE)")
-        print("  python3 %s --apply" % os.path.basename(sys.argv[0]))
-        print("  Shows the change, asks, backs up settings.json. Or paste this")
-        print("  into ~/.claude/settings.json under permissions.deny:")
-        print(textwrap.fill(", ".join('"%s"' % n for n in sorted(candidates)),
-                            width=WIDTH, initial_indent="    ",
-                            subsequent_indent="    "))
-        print()
-        return 0
-
-    head("TURNING THEM OFF")
-    para("%d tool(s) will be added to permissions.deny. Their descriptions "
-         "stop being sent, so Claude will not see or offer them."
-         % len(candidates))
-    if check and not args.include_check_first:
-        print()
-        para("The %d check-first tool(s) are left alone. Pass "
-             "--include-check-first if you want those too." % len(check))
-    apply_deny(settings_path(args.settings), candidates, args.yes)
     print()
     return 0
+
 
 
 if __name__ == "__main__":
