@@ -344,77 +344,82 @@ def close_partners(live):
     return live
 
 
-def strip_dynamic(sessions, price, warmup=5):
-    """Plugin A: strip the manifest per cache lineage instead of per machine.
+def strip_dynamic(sessions, price, dead_tokens, candidates, eligible):
+    """Lever A: the tool schemas this developer never calls are absent.
 
-    A static deny list has to be the intersection of what you never call
-    ANYWHERE. An in-path proxy sees one conversation at a time, so it can drop
-    everything this conversation has not asked for -- which is a much bigger set.
+    Priced as exactly the policy this output describes, using exactly the token
+    weight of exactly the tool list it prints: `candidates` -- no call anywhere
+    in the window -- stripped from every request in every lineage. The headline
+    saving and the printed names cannot describe two different policies.
 
-    Two numbers, because the gap between them is the honest cost of not having
-    foresight:
+    An earlier version priced something else and called it lever A: it armed at
+    the first cold start after a few requests and then stripped whatever had not
+    been called *yet*. That was unsound in two ways. It is not quality-neutral --
+    a lineage whose first `Workflow` call lands at request 200 had the schema
+    stripped at request 6, on the evidence of five requests. And because "not
+    called in the first five requests" is a bigger set than "never called at
+    all", it reported savings ABOVE the oracle below, which is how the bug
+    surfaced: a 13.9% saving under a 10.9% ceiling. Deleted, not repaired.
 
-      oracle  -- strip everything the lineage never calls, from request one.
-                 Unreachable; it is the ceiling.
-      cold    -- strip at the first cold start after `warmup` requests, using
-                 only what has been called so far. Implementable.
+      static  -- what lever A is, and what is reported.
+      oracle  -- `candidates` PLUS anything else this particular lineage never
+                 asks for, same eligibility rules, from request one. Needs
+                 foresight, so unreachable -- but its set contains `candidates`
+                 on every lineage, so it is a true upper bound. The gap is what
+                 per-conversation trimming is worth on top of per-developer
+                 trimming.
 
-    The manifest sits FIRST in the request, so rewriting it invalidates the whole
-    cached prefix. At a cold start the prefix is being written anyway, so the
-    change is free; anywhere else it costs a full re-write. `cold` only ever
-    strips at a cold start, and `invalidation` reports what the same policy would
-    have cost if it had not waited.
+    naive_rewrite is a transition cost, not a steady-state one. The manifest
+    sits FIRST in the request, so introducing the change part-way through a live
+    lineage invalidates the whole cached prefix behind it. Stripping from request
+    one costs nothing extra; doing it at the first warm request costs a full
+    prefix re-write, which is what this reports.
     """
-    pool = {n: tokens_of(n) for n, v in TOOLS.items()
-            if v[2] != "interactive" and v[0] > 0}
-    pool_tok = sum(pool.values())
-
-    def dead_of(live):
-        live = close_partners(live)
-        return sum(t for n, t in pool.items() if n not in live)
-
-    oracle = cold = 0.0
+    cand = set(candidates)
+    static = oracle = 0.0
     naive_rewrite = 0.0
-    reached = 0
-    cold_rows = []
+    static_rows = []
     for rows in sessions:
-        ever = dead_of({n for r in rows for n in r["calls"]})
-        armed = False
-        trim = 0
-        seen = set()
-        for n, r in enumerate(rows):
-            # oracle: perfect foresight for the whole lineage
+        live = close_partners({n for r in rows for n in r["calls"]})
+        # Superset of `cand` by construction: every candidate is counted, plus
+        # whatever else this lineage left untouched.
+        ever = sum(t for n, t in eligible.items()
+                   if n in cand or n not in live)
+        for r in rows:
+            static += _row_cost(r, price, dead_tokens)
             oracle += _row_cost(r, price, ever)
-            # cold: nothing stripped until the first cold start after warm-up
-            if not armed and n >= warmup and r["cold"]:
-                armed = True
-                reached += 1
-                trim = dead_of(seen)
-            d = trim if armed else 0
-            cold += _row_cost(r, price, d)
-            q = dict(r)
-            q["r"] = max(0, q["r"] - d)
-            if q["cold"]:
-                q["w"] = max(0, q["w"] - d)
-            cold_rows.append(q)
-            seen.update(r["calls"])
-        # What a policy that did NOT wait for a cold start would have paid here:
-        # rewriting the manifest mid-prefix forces the whole prefix to be written
-        # again. Charged only where request `warmup` was in fact warm.
-        if len(rows) > warmup and not rows[warmup]["cold"]:
-            naive_rewrite += (rows[warmup]["prev"] * price["cache_write"]) / 1e6
-    return {"oracle": oracle, "cold": cold, "reached": reached,
-            "lineages": len(sessions), "pool_tokens": pool_tok,
-            "pool_tools": len(pool), "naive_rewrite": naive_rewrite,
-            "cold_rows": cold_rows}
+            static_rows.append(_row_strip(r, dead_tokens))
+        # Cost of switching the manifest part-way through this lineage rather
+        # than at a cold start, where the prefix was being written anyway.
+        warm = next((r for r in rows if not r["cold"] and r["prev"] > 0), None)
+        if warm:
+            naive_rewrite += (warm["prev"] * price["cache_write"]) / 1e6
+    return {"static": static, "oracle": oracle, "lineages": len(sessions),
+            "pool_tokens": sum(eligible.values()), "pool_tools": len(eligible),
+            "naive_rewrite": naive_rewrite, "static_rows": static_rows}
+
+
+def _row_strip(r, dead):
+    """One request as it would have been with `dead` manifest tokens absent.
+
+    The manifest sits at the front of the cached prefix, so a cold start pays
+    for it in the tokens it WRITES and a warm request pays for it in the tokens
+    it READS -- never both. Subtracting it from both buckets on a cold row, as
+    this used to, charged the same saving twice.
+    """
+    q = dict(r)
+    if q["cold"]:
+        q["w"] = max(0, q["w"] - dead)
+    else:
+        q["r"] = max(0, q["r"] - dead)
+    return q
 
 
 def _row_cost(r, price, dead):
     """One request's cost with `dead` manifest tokens removed."""
-    rr = max(0, r["r"] - dead)
-    ww = max(0, r["w"] - dead) if r["cold"] else r["w"]
-    return (r["i"] * price["input"] + r["o"] * price["output"]
-            + ww * price["cache_write"] + rr * price["cache_read"]) / 1e6
+    q = _row_strip(r, dead)
+    return (q["i"] * price["input"] + q["o"] * price["output"]
+            + q["w"] * price["cache_write"] + q["r"] * price["cache_read"]) / 1e6
 
 
 def lineage_costs(sessions, price):
@@ -612,7 +617,14 @@ def main():
 
     # Price exactly the tools we are actually offering to switch off, so
     # --include-check-first changes the saving and not just the note below.
+    # This is the single definition: lever A is priced from it, and the tool
+    # names printed under "A --" are the set it was summed over.
     dead_tokens = sum(tokens_of(n) for n in candidates)
+    # Tools the oracle is allowed to consider, i.e. the same risk classes the
+    # candidate set was drawn from, so ceiling and saving stay comparable.
+    eligible = {n: tokens_of(n) for n, v in TOOLS.items()
+                if v[2] != "interactive" and v[0] > 0
+                and (v[2] == "low" or args.include_check_first)}
 
     # --- the two levers, both in the request path -------------------------
     # A: rewrite the tools array per developer, from that developer's own call
@@ -620,9 +632,9 @@ def main():
     # Neither is reachable from inside Claude Code.
     baseline = cost_of(rows, price)
 
-    dyn = strip_dynamic(s["sessions"], price)
-    cost_a = dyn["cold"]
-    after_b, extra_b, _ = lever_refresh(dyn["cold_rows"], price,
+    dyn = strip_dynamic(s["sessions"], price, dead_tokens, candidates, eligible)
+    cost_a = dyn["static"]
+    after_b, extra_b, _ = lever_refresh(dyn["static_rows"], price,
                                         args.refresh_every)
     cost_ab = cost_of(after_b, price, extra_b)
     # B on its own, against the untouched baseline, so the two are comparable.
@@ -690,10 +702,10 @@ def main():
         print("  keeps them (%s tokens):" % num(tot_check))
         print(textwrap.fill(" ".join(sorted(check)), width=WIDTH,
                             initial_indent="    ", subsequent_indent="    "))
-    print("  ceiling if every lineage were trimmed perfectly: %s"
-          % pct((baseline - dyn["oracle"]) / baseline))
-    print("  lineages that reach a usable trim point: %d of %d"
-          % (dyn["reached"], dyn["lineages"]))
+    print("  ceiling if each conversation also dropped what only IT never"
+          " calls: %s" % pct((baseline - dyn["oracle"]) / baseline))
+    print("  one-off cost of switching mid-conversation, not at a cold start: %s"
+          % usd(dyn["naive_rewrite"]))
 
     # --- lever B facts ----------------------------------------------------
     head("B -- CACHE EXPIRY  (%ds TTL, write bills %.1fx read)"
