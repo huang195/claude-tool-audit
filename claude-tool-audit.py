@@ -3,33 +3,43 @@
 
 WHY THIS EXISTS
 ---------------
-Measured over one developer's full 30-day history (53 sessions, 3,631 requests,
-1.06 B tokens, $1,032 at Opus list): **89% of the money went on writing and
-re-reading context that had already been sent.** New input was 1.1% of spend
-and output was 9.9%.
+Measured over one developer's full 30-day history (56 sessions, 4,534 requests,
+1.12 B tokens, $1,097 at Opus list): **88% of the money went on writing and
+re-reading context that had already been sent.** New input was 1.3% of spend
+and output was 10.8%.
 
 That means the big levers are not "say less" or "use a cheaper model" -- both of
 which cost you answer quality. The big levers are about not paying twice for
 the same bytes. This script prices three of them against YOUR history:
 
   1. Dead tool schemas   -- tools declared on every request that you never call.
-                            Switch off today. Measured 4.4% on the reference
-                            machine.
+                            Switch off today with a deny list. Measured 5.3%
+                            on the reference machine. FREE.
   2. Cache expiry        -- after a 5-minute pause the prompt cache drops and the
                             next request RE-WRITES the whole conversation at
                             12.5x the price of re-reading it. Refreshing it
                             first is byte-identical to the model. Measured
-                            +13.0 points. Needs a proxy; not a local switch.
+                            +11.9 points. NEEDS A PROXY -- Claude Code has no
+                            way to refresh its own cache.
   3. Unbatched tool calls-- most requests carry exactly one tool call, and every
                             request re-reads the entire context. Batching
                             independent calls removes whole round trips.
-                            Measured +7.8 points. A CLAUDE.md instruction.
+                            Measured +7.8 points. A CLAUDE.md line. FREE.
 
 None of the three changes the model, the context, or the information available
-to it. On the reference machine they compound to 25.2%.
+to it. On the reference machine they compound to 25.0%.
 
-Run it, then send back the block printed by --report so we can pool results and
-see how much this varies between people. That variance is the open question.
+THE QUESTION THIS RUN IS MEANT TO ANSWER
+----------------------------------------
+Two of the three are free and need no infrastructure. Only lever 2 requires
+something sitting in the request path. So the number that decides whether such
+a thing is worth building is not the 25% -- it is what an in-path component
+adds for someone who has ALREADY taken the free wins. On the reference machine
+that is 11.9 points, and nearly all of it is lever 2.
+
+Run it, then send back the block printed by --report. Both halves matter: the
+free levers so you can act on them this week, and the in-path number so we can
+see how much it varies between people. That variance is the open question.
 
 WHAT IT READS
 -------------
@@ -39,18 +49,20 @@ counts. It never reads prompts, tool arguments, tool results, or completions.
 
 WHAT IT SENDS
 -------------
-Nothing, ever, on its own. --measure makes exactly two `claude --print` calls
-with the fixed prompt "say ok" to measure your real manifest size. --apply only
-edits your local settings.json, after a backup. --report prints a block to your
+Nothing, ever, on its own. --measure makes exactly three `claude --print` calls
+with the fixed prompt "say ok" to weigh your real manifest. --apply only edits
+your local settings.json, after a backup. --report prints a block to your
 terminal for you to paste wherever you choose; it contains aggregate numbers and
 built-in tool names only -- no paths, project names, branches, or MCP server
 names.
 
 USAGE
 -----
+    python3 claude-tool-audit.py --report --measure   # <-- please run this one
     python3 claude-tool-audit.py                  # the three levers, priced
     python3 claude-tool-audit.py --report         # + a block to paste back
-    python3 claude-tool-audit.py --measure        # + verify lever 1 (2 requests)
+    python3 claude-tool-audit.py --measure        # + weigh the manifest on the
+                                                  #   wire (3 "say ok" requests)
     python3 claude-tool-audit.py --apply          # + turn off dead tools
     python3 claude-tool-audit.py --verbose        # + every tool, + sensitivity
 
@@ -224,6 +236,7 @@ def scan(days, root=None):
     models = collections.Counter()
     lineages = collections.defaultdict(list)
     msg_calls = collections.Counter()      # message id -> tool_use blocks
+    msg_names = collections.defaultdict(list)   # message id -> tool names
     msg_seen = set()                       # message ids that were assistant turns
     first = last = None
 
@@ -274,6 +287,7 @@ def scan(days, root=None):
                            bool(rec.get("isSidechain")))
                     lineages[key].append({
                         "t": when,
+                        "mid": mid,
                         "i": u.get("input_tokens") or 0,
                         "w": u.get("cache_creation_input_tokens") or 0,
                         "r": u.get("cache_read_input_tokens") or 0,
@@ -288,12 +302,16 @@ def scan(days, root=None):
                     if not bid or bid in seen_calls:
                         continue
                     seen_calls.add(bid)
+                    name = blk.get("name") or "?"
                     if mid:
                         msg_calls[mid] += 1
+                        msg_names[mid].append(name)
                     tgt = sub if rec.get("isSidechain") else main
-                    tgt[blk.get("name") or "?"] += 1
+                    tgt[name] += 1
 
     # Order each lineage and mark cold starts and the prefix each request carried.
+    # `calls` is joined on message id AFTER the scan, because the record carrying
+    # `usage` is often not the one carrying the tool_use blocks.
     sessions = []
     for rows in lineages.values():
         rows.sort(key=lambda x: x["t"])
@@ -303,6 +321,7 @@ def scan(days, root=None):
             r["cold"] = n == 0 or gap > TTL_SECONDS
             r["prev"] = (rows[n - 1]["i"] + rows[n - 1]["w"] + rows[n - 1]["r"]
                          if n else 0)
+            r["calls"] = msg_names.get(r["mid"], ()) if r["mid"] else ()
         sessions.append(rows)
 
     return {
@@ -361,6 +380,95 @@ def lever_tools(rows, dead_tokens):
             q["w"] -= dead_tokens
         out.append(q)
     return out
+
+
+def close_partners(live):
+    """A tool whose partner is in use has to stay: dropping SendMessage while
+    Agent is still offered would break the workflow it belongs to."""
+    live = set(live)
+    for dep, principal in PARTNER.items():
+        if principal in live:
+            live.add(dep)
+    return live
+
+
+def strip_dynamic(sessions, price, warmup=5):
+    """Plugin A: strip the manifest per cache lineage instead of per machine.
+
+    A static deny list has to be the intersection of what you never call
+    ANYWHERE. An in-path proxy sees one conversation at a time, so it can drop
+    everything this conversation has not asked for -- which is a much bigger set.
+
+    Two numbers, because the gap between them is the honest cost of not having
+    foresight:
+
+      oracle  -- strip everything the lineage never calls, from request one.
+                 Unreachable; it is the ceiling.
+      cold    -- strip at the first cold start after `warmup` requests, using
+                 only what has been called so far. Implementable.
+
+    The manifest sits FIRST in the request, so rewriting it invalidates the whole
+    cached prefix. At a cold start the prefix is being written anyway, so the
+    change is free; anywhere else it costs a full re-write. `cold` only ever
+    strips at a cold start, and `invalidation` reports what the same policy would
+    have cost if it had not waited.
+    """
+    pool = {n: tokens_of(n) for n, v in TOOLS.items()
+            if v[2] != "interactive" and v[0] > 0}
+    pool_tok = sum(pool.values())
+
+    def dead_of(live):
+        live = close_partners(live)
+        return sum(t for n, t in pool.items() if n not in live)
+
+    oracle = cold = 0.0
+    naive_rewrite = 0.0
+    reached = 0
+    cold_rows = []
+    for rows in sessions:
+        ever = dead_of({n for r in rows for n in r["calls"]})
+        armed = False
+        trim = 0
+        seen = set()
+        for n, r in enumerate(rows):
+            # oracle: perfect foresight for the whole lineage
+            oracle += _row_cost(r, price, ever)
+            # cold: nothing stripped until the first cold start after warm-up
+            if not armed and n >= warmup and r["cold"]:
+                armed = True
+                reached += 1
+                trim = dead_of(seen)
+            d = trim if armed else 0
+            cold += _row_cost(r, price, d)
+            q = dict(r)
+            q["r"] = max(0, q["r"] - d)
+            if q["cold"]:
+                q["w"] = max(0, q["w"] - d)
+            cold_rows.append(q)
+            seen.update(r["calls"])
+        # What a policy that did NOT wait for a cold start would have paid here:
+        # rewriting the manifest mid-prefix forces the whole prefix to be written
+        # again. Charged only where request `warmup` was in fact warm.
+        if len(rows) > warmup and not rows[warmup]["cold"]:
+            naive_rewrite += (rows[warmup]["prev"] * price["cache_write"]) / 1e6
+    return {"oracle": oracle, "cold": cold, "reached": reached,
+            "lineages": len(sessions), "pool_tokens": pool_tok,
+            "pool_tools": len(pool), "naive_rewrite": naive_rewrite,
+            "cold_rows": cold_rows}
+
+
+def _row_cost(r, price, dead):
+    """One request's cost with `dead` manifest tokens removed."""
+    rr = max(0, r["r"] - dead)
+    ww = max(0, r["w"] - dead) if r["cold"] else r["w"]
+    return (r["i"] * price["input"] + r["o"] * price["output"]
+            + ww * price["cache_write"] + rr * price["cache_read"]) / 1e6
+
+
+def lineage_costs(sessions, price):
+    """Per-lineage spend, biggest first. Lever 2 lives in long sessions, so how
+    concentrated someone's spend is decides whether it applies to them at all."""
+    return sorted((cost_of(rows, price) for rows in sessions), reverse=True)
 
 
 def lever_refresh(rows, price, every=240.0, adaptive=True):
@@ -434,15 +542,21 @@ def batching_stats(msg_calls, msg_seen, target):
 # Phase 2 -- optional live measurement (2 API calls, no proxy needed)
 # ---------------------------------------------------------------------------
 
-def measure(deny):
-    """Return ((baseline, denied), None) or (None, error).
+def measure(deny, mcp=False):
+    """Return ((baseline, denied, no_mcp), None) or (None, error).
 
-    Two `claude --print --output-format json` calls in an empty directory with
-    the same prompt. The only difference between them is the tool manifest, so
-    the prompt-token delta is exactly what the denied schemas cost per turn.
+    Up to three `claude --print --output-format json` calls in an empty directory
+    with the same prompt. The only difference between them is the tool manifest,
+    so each prompt-token delta is exactly what those schemas cost per turn.
+
+    The third call adds --strict-mcp-config, which starts the session with no MCP
+    servers at all. That delta is the size of your MCP tool descriptions -- a
+    number nothing else reports, and the one quantity this whole analysis cannot
+    get from transcripts. `no_mcp` is None if the run was skipped or unsupported.
     """
-    def one(settings_path, workdir):
+    def one(settings_path, workdir, extra=()):
         cmd = ["claude", "--print", "--output-format", "json", "say ok"]
+        cmd[1:1] = list(extra)
         if settings_path:
             cmd[1:1] = ["--settings", settings_path]
         try:
@@ -464,13 +578,20 @@ def measure(deny):
         base, err = one(None, work)
         if base is None:
             return None, err
-        sp = os.path.join(work, "deny-settings.json")
-        with open(sp, "w") as fh:
-            json.dump({"permissions": {"deny": sorted(deny)}}, fh)
-        trimmed, err = one(sp, work)
-        if trimmed is None:
-            return None, err
-    return (base, trimmed), None
+        trimmed = None
+        if deny:
+            sp = os.path.join(work, "deny-settings.json")
+            with open(sp, "w") as fh:
+                json.dump({"permissions": {"deny": sorted(deny)}}, fh)
+            trimmed, err = one(sp, work)
+            if trimmed is None:
+                return None, err
+        no_mcp = None
+        if mcp:
+            # Older Claude Code has no --strict-mcp-config; a failure here is not
+            # fatal, it just means this one number is unavailable.
+            no_mcp, _ = one(None, work, extra=["--strict-mcp-config"])
+    return (base, trimmed, no_mcp), None
 
 
 # ---------------------------------------------------------------------------
@@ -699,28 +820,51 @@ def main():
 
     # --- measure first, so lever 1 can use a real number if we have one ----
     measured = None
-    if args.measure and candidates:
-        head("MEASURING LEVER 1 AGAINST THE REAL API")
-        para("Sending two requests with the prompt \"say ok\" from an empty "
-             "directory -- one with your normal tools, one with these %d "
-             "switched off. The difference is exactly what they cost you, on "
-             "your machine and your Claude Code version." % len(candidates))
+    mcp_tokens = None
+    wire_manifest = None
+    if args.measure:
+        head("MEASURING AGAINST THE REAL API")
+        para("Sending requests with the prompt \"say ok\" from an empty directory "
+             "-- one with your normal tools, one with the dead ones switched "
+             "off, one with --strict-mcp-config. Each difference is exactly what "
+             "those schemas cost you, on your machine and your Claude Code "
+             "version.")
         print()
-        res, err = measure(candidates)
+        res, err = measure(candidates, mcp=True)
         if res is None:
             para("Could not measure: %s" % err)
         else:
-            base_tok, trimmed_tok = res
-            measured = base_tok - trimmed_tok
+            base_tok, trimmed_tok, no_mcp_tok = res
+            wire_manifest = base_tok
             print("    every tool on      %9s tokens in the request"
                   % num(base_tok))
-            print("    %2d tools off       %9s tokens in the request"
-                  % (len(candidates), num(trimmed_tok)))
+            if trimmed_tok is not None:
+                measured = base_tok - trimmed_tok
+                print("    %2d tools off       %9s tokens in the request"
+                      % (len(candidates), num(trimmed_tok)))
+            if no_mcp_tok is not None:
+                mcp_tokens = max(0, base_tok - no_mcp_tok)
+                print("    no MCP servers     %9s tokens in the request"
+                      % num(no_mcp_tok))
             print("    " + "-" * 46)
-            print("    you save           %9s tokens, every request"
-                  % num(measured))
-            print("                       %8.1f%% of that request"
-                  % (100.0 * measured / base_tok if base_tok else 0))
+            if measured:
+                print("    dead built-ins     %9s tokens, every request"
+                      % num(measured))
+                print("                       %8.1f%% of that request"
+                      % (100.0 * measured / base_tok if base_tok else 0))
+            if mcp_tokens is not None:
+                print("    MCP tool schemas   %9s tokens, every request"
+                      % num(mcp_tokens))
+                print("                       %8.1f%% of that request"
+                      % (100.0 * mcp_tokens / base_tok if base_tok else 0))
+                print()
+                para("That MCP figure is the number this analysis could not get "
+                     "any other way. A static deny list cannot reach it; only "
+                     "something in the request path can. Please include it.")
+            elif args.measure:
+                print()
+                para("MCP size unavailable -- your Claude Code may predate "
+                     "--strict-mcp-config. Everything else still stands.")
             est = sum(tokens_of(n) for n in candidates)
             if measured and est:
                 print()
@@ -728,7 +872,10 @@ def main():
                      "estimated = %.2f. The measured number is used from here on."
                      % (num(est), measured / est))
 
-    dead_tokens = measured if measured else tot_safe
+    # Price exactly the tools we are actually offering to switch off, so
+    # --include-check-first changes the saving and not just the note below.
+    tot_offered = sum(tokens_of(n) for n in candidates)
+    dead_tokens = measured if measured else tot_offered
     dead_source = "measured" if measured else "estimated"
 
     # --- the three levers, applied cumulatively ---------------------------
@@ -739,6 +886,23 @@ def main():
     cost2 = cost_of(after2, price, extra2)
     bat = batching_stats(s["msg_calls"], s["msg_seen"], args.batch_target)
     cost3 = cost_of(after2, price, extra2, read_scale=1 - bat["cut"])
+
+    # --- the same levers, split by who can actually implement them ---------
+    # Free: a deny list in settings.json, and a CLAUDE.md line. Needs nothing.
+    # In-path: per-lineage stripping and per-session refresh. Needs a proxy.
+    agg_dead = sum(tokens_of(n) for n in low + check)
+    cost_free_static = cost_of(lever_tools(rows, agg_dead), price)
+
+    dyn = strip_dynamic(s["sessions"], price)
+    cost_a = dyn["cold"]
+    after_b, extra_b, ref_b = lever_refresh(dyn["cold_rows"], price,
+                                            args.refresh_every)
+    cost_ab = cost_of(after_b, price, extra_b)
+    # Plugin B on its own, against the untouched baseline.
+    solo_b, extra_sb, _ = lever_refresh(rows, price, args.refresh_every)
+    cost_b_only = cost_of(solo_b, price, extra_sb)
+    # What an in-path component adds for someone who already took the free wins.
+    incremental = cost_free_static - cost_ab
 
     u = s["usage"]
     comp = [("cache read", u["cache_read_input_tokens"], price["cache_read"]),
@@ -763,19 +927,44 @@ def main():
          "sees byte-identical prompts in every case."
          % (usd(baseline - cost3), pct((baseline - cost3) / baseline)))
     print()
-    print("    %-42s %9s %8s" % ("cumulative", "cost", "saved"))
-    print("    %-42s %9s %8s" % ("your last %d days" % args.days,
-                                 usd(baseline), "-"))
-    for label, c in (("+ 1. drop never-called tool schemas", cost1),
-                     ("+ 2. refresh cache before it expires", cost2),
-                     ("+ 3. batch tool calls (%.2f -> %.2f/req)"
-                      % (bat["mean"], args.batch_target), cost3)):
-        print("    %-42s %9s %7s" % (label, usd(c),
-                                     pct((baseline - c) / baseline)))
+    print("    %-40s %9s %7s  %s" % ("cumulative", "cost", "saved", "needs"))
+    print("    %-40s %9s %7s  %s" % ("your last %d days" % args.days,
+                                     usd(baseline), "-", ""))
+    for label, c, who in (
+            ("+ 1. drop never-called tool schemas", cost1, "settings.json"),
+            ("+ 2. refresh cache before it expires", cost2, "a proxy"),
+            ("+ 3. batch tool calls (%.2f -> %.2f/req)"
+             % (bat["mean"], args.batch_target), cost3, "CLAUDE.md")):
+        print("    %-40s %9s %7s  %s" % (label, usd(c),
+                                         pct((baseline - c) / baseline), who))
     print()
-    para("Lever 1 you can switch on today. Lever 3 is a CLAUDE.md instruction. "
-         "Lever 2 needs something in the request path -- a proxy -- because "
-         "Claude Code has no way to refresh its own cache.")
+    para("Levers 1 and 3 cost nothing and need no code: a deny list in "
+         "settings.json and one line in CLAUDE.md. Lever 2 cannot be done from "
+         "inside Claude Code at all -- it has no way to refresh its own cache -- "
+         "so it needs something sitting in the request path.")
+    print()
+    para("That split is the point of this run. Of the %s above, %s is free and "
+         "yours today; %s is the part that needs a proxy, and it is the biggest "
+         "single piece."
+         % (pct((baseline - cost3) / baseline),
+            pct((baseline - cost1 + cost2 - cost3) / baseline),
+            pct((cost1 - cost2) / baseline)))
+    print()
+    print("    %-40s %9s %7s" % ("what a proxy could do, standalone", "cost",
+                                 "saved"))
+    print("    %-40s %9s %7s" % ("  manifest trimmed per developer",
+                                 usd(cost_a), pct((baseline - cost_a) / baseline)))
+    print("    %-40s %9s %7s" % ("  + adaptive cache refresh", usd(cost_ab),
+                                 pct((baseline - cost_ab) / baseline)))
+    print("    %-40s %9s %7s" % ("  net of the BEST free deny list", "",
+                                 pct(incremental / baseline)))
+    print()
+    para("The last row is the honest number to judge a proxy on: what it adds "
+         "for someone who has already turned off every tool they can. Nearly "
+         "all of it is the cache refresh -- trimming the manifest dynamically "
+         "beats a static deny list by very little on built-ins alone. If MCP "
+         "servers are a big part of your context, that changes; run --measure "
+         "and we will know.")
 
     # --- 2. where the money actually goes ---------------------------------
     head("WHERE THE MONEY WENT")
@@ -940,7 +1129,10 @@ def main():
              "normally means an MCP tool, or a newer Claude Code than the one "
              "this table was measured on:" % len(unknown))
         for n in unknown:
-            print("    %s" % n)
+            # MCP tool names embed the server name, which can name an internal
+            # system. Shown masked, because this output gets pasted around.
+            print("    %s" % (("mcp__<server>__%s" % n.split("__")[-1])
+                              if n.startswith("mcp__") else n))
 
     # --- 7. MCP servers ---------------------------------------------------
     servers = configured_mcp_servers()
@@ -951,18 +1143,21 @@ def main():
         head("MCP SERVERS -- %d configured, %d used in this window"
              % (len(servers), len(servers) - len(idle)))
         if idle:
-            para("No calls at all from: %s" % ", ".join(idle))
+            para("No calls at all from: %s   <-- the only line in this whole "
+                 "output that names anything of yours. Delete it before you "
+                 "paste; the counts are already in the report block."
+                 % ", ".join(idle))
             print()
-            para("MCP tool descriptions are often the largest part of a "
-                 "request and this script cannot size them, so they are NOT in "
-                 "any total above. Dropping a server you never use is usually "
-                 "the single biggest win available. Remove it from your config, "
-                 "or start a session with --strict-mcp-config to leave all of "
-                 "them out.")
+            para("MCP tool descriptions are often the largest part of a request "
+                 "and are NOT in any total above. Dropping a server you never "
+                 "use is usually the single biggest win available. Remove it "
+                 "from your config, or start a session with --strict-mcp-config "
+                 "to leave all of them out. Pass --measure to see what they "
+                 "weigh on your wire.")
         else:
-            para("All of them saw calls, so there is nothing to trim here. "
-                 "Note that MCP tool descriptions are not counted in any total "
-                 "above -- this script cannot size them.")
+            para("All of them saw calls, so there is nothing to trim here. MCP "
+                 "tool descriptions are not counted in any total above; pass "
+                 "--measure to see what they weigh on your wire.")
 
     # --- 8. how the numbers were made ------------------------------------
     head("HOW THESE NUMBERS WERE MADE")
@@ -991,45 +1186,134 @@ def main():
     if args.report:
         head("PASTE THIS BACK")
         para("Aggregate numbers and built-in tool names only. No paths, project "
-             "names, branches, prompts, or MCP server names. Read it before you "
-             "send it -- it is all on screen.")
+             "names, branches, prompts, tool arguments, or MCP server names. "
+             "Read it before you send it -- it is all on screen, and it is the "
+             "only thing anyone needs from you.")
         print()
+        para("Four fields are worth a word. `in_path` is what only a proxy can "
+             "do and `free_no_code` is what you can do today, so the comparison "
+             "between them is the decision. `refresh_sensitivity` shows adaptive "
+             "refresh (refresh a gap only when that is cheaper than letting it "
+             "expire) against blanket refresh (refresh always) -- if blanket is "
+             "negative for you too, the adaptive part is the whole trick. "
+             "`profile.top4_lineages_pct` says whether your spend is "
+             "concentrated in a few long sessions, which is where refresh pays. "
+             "`mcp.schema_tokens` is null unless you pass --measure; it is the "
+             "one number transcripts cannot give.")
+        print()
+        para("If you can spare 30 seconds, re-run as `--report --measure`. It "
+             "sends three throwaway \"say ok\" requests and fills in what your "
+             "tool schemas actually weigh on the wire.")
+        print()
+
+        def p(x):                      # share of the baseline, one decimal
+            return round(100.0 * x / baseline, 1) if baseline else None
+
+        lc = lineage_costs(s["sessions"], price)
+        ctx_tok = [r["i"] + r["w"] + r["r"] for r in rows]
+        mean_ctx = sum(ctx_tok) / len(ctx_tok) if ctx_tok else 0
+        pool_names = {n for n, v in TOOLS.items()
+                      if v[2] != "interactive" and v[0] > 0}
+        mcp_called = sorted(n for n in called if n.startswith("mcp__"))
+
+        sens = {}
+        for every in (120.0, 180.0, 240.0, 270.0, 290.0):
+            ra, ea, _ = lever_refresh(rows, price, every, True)
+            rb, eb, _ = lever_refresh(rows, price, every, False)
+            sens[int(every)] = {
+                "adaptive_pct": p(baseline - cost_of(ra, price, ea)),
+                "blanket_pct": p(baseline - cost_of(rb, price, eb)),
+            }
+
         blob = {
-            "schema": "claude-cost-audit/2",
-            "window_days": args.days,
-            "requests": s["turns"],
-            "lineages": len(s["sessions"]),
-            "tool_calls": s["calls"],
+            "schema": "claude-cost-audit/3",
+            "window": {
+                "days": args.days,
+                "from": s["first"].date().isoformat() if s["first"] else None,
+                "to": s["last"].date().isoformat() if s["last"] else None,
+                "requests": s["turns"],
+                "cache_lineages": len(s["sessions"]),
+                "tool_calls": s["calls"],
+                "distinct_tools": len(called),
+                "claude_code": sorted(s["versions"])[-3:],
+            },
+            "spend_usd": {
+                "total": round(baseline, 2),
+                "cache_read": round(next(c for n, t, c in comp
+                                         if n == "cache read"), 2),
+                "cache_write": round(next(c for n, t, c in comp
+                                          if n == "cache write"), 2),
+                "output": round(next(c for n, t, c in comp
+                                     if n == "output"), 2),
+                "input_uncached": round(next(c for n, t, c in comp
+                                             if n == "uncached input"), 2),
+                "context_share_pct": round(100.0 * context_share, 1),
+            },
             "tokens": {k: u[k] for k in sorted(u)},
-            "baseline_usd": round(baseline, 2),
-            "levers_cumulative_usd": {
-                "1_drop_dead_tools": round(cost1, 2),
-                "2_refresh_cache": round(cost2, 2),
-                "3_batch_tool_calls": round(cost3, 2),
+            "profile": {
+                "mean_context_tokens": int(mean_ctx),
+                "median_lineage_usd": round(lc[len(lc) // 2], 2) if lc else 0,
+                "top1_lineage_pct": p(lc[0]) if lc else None,
+                "top4_lineages_pct": p(sum(lc[:4])) if lc else None,
+                "idle_gap_cold_starts": ref["gaps"],
+                "idle_gap_cold_start_pct": round(
+                    100.0 * ref["gaps"] / s["turns"], 1) if s["turns"] else None,
+                "cold_start_write_share_pct": round(100.0 * cold_w / all_w, 1),
             },
-            "levers_saved_pct": {
-                "1_drop_dead_tools": round(100.0 * (baseline - cost1) / baseline, 1),
-                "2_refresh_cache": round(100.0 * (cost1 - cost2) / baseline, 1),
-                "3_batch_tool_calls": round(100.0 * (cost2 - cost3) / baseline, 1),
-                "total": round(100.0 * (baseline - cost3) / baseline, 1),
+            # ---- what needs something in the request path -------------------
+            "in_path": {
+                "plugin_a_strip_dynamic_pct": p(baseline - cost_a),
+                "plugin_a_oracle_ceiling_pct": p(baseline - dyn["oracle"]),
+                "plugin_b_refresh_alone_pct": p(baseline - cost_b_only),
+                "both_plugins_pct": p(baseline - cost_ab),
+                "incremental_over_free_deny_list_pct": p(incremental),
+                "incremental_usd": round(incremental, 2),
+                "lineages_reaching_cold_start": dyn["reached"],
+                "lineages_total": dyn["lineages"],
+                "naive_mid_prefix_rewrite_usd": round(dyn["naive_rewrite"], 2),
+                "gaps_worth_refreshing": ref["wins"],
+                "gaps_seen": ref["gaps"],
+                "refresh_requests": ref["refreshes"],
+                "refresh_interval_s": args.refresh_every,
             },
-            "lever1": {"dead_tokens": int(dead_tokens),
-                       "source": dead_source,
-                       "never_called": sorted(low),
-                       "never_called_check_first": sorted(check)},
-            "lever2": {"cold_start_requests": ref["gaps"],
-                       "cold_start_write_share_pct": round(100.0 * cold_w / all_w, 1),
-                       "gaps_worth_refreshing": ref["wins"],
-                       "refresh_requests": ref["refreshes"],
-                       "refresh_interval_s": args.refresh_every},
-            "lever3": {"mean_calls_per_request": round(bat["mean"], 3),
-                       "single_call_share_pct": round(100.0 * bat["single_share"], 1),
-                       "target": args.batch_target,
-                       "requests_cut_pct": round(100.0 * bat["cut"], 1)},
-            "mcp_servers_configured": len(servers),
-            "mcp_servers_unused": len(idle) if servers else 0,
-            "unknown_tools": len(unknown),
-            "claude_code_versions": sorted(s["versions"])[-3:],
+            "refresh_sensitivity": sens,
+            # ---- what anyone can do today, with no code ---------------------
+            "free_no_code": {
+                "static_deny_conservative_pct": p(baseline - cost1),
+                "static_deny_aggressive_pct": p(baseline - cost_free_static),
+                "batching_pct": p(cost2 - cost3),
+                "calls_per_request": round(bat["mean"], 3),
+                "single_call_share_pct": round(100.0 * bat["single_share"], 1),
+                "batch_target_used": args.batch_target,
+            },
+            "three_lever_stack_pct": p(baseline - cost3),
+            "manifest": {
+                "priced_tools": dyn["pool_tools"],
+                "priced_tokens": dyn["pool_tokens"],
+                "share_of_mean_context_pct": round(
+                    100.0 * dyn["pool_tokens"] / mean_ctx, 1) if mean_ctx else None,
+                "priced_tools_ever_called": len(pool_names & set(called)),
+                "never_called": sorted(low),
+                "never_called_check_first": sorted(check),
+                "dead_tokens_used": int(dead_tokens),
+                "dead_tokens_source": dead_source,
+            },
+            # ---- the one quantity nothing else reports ----------------------
+            "mcp": {
+                "servers_configured": len(servers),
+                "servers_never_used": len(idle) if servers else 0,
+                "tools_called": len(mcp_called),
+                "tools_unpriced_by_this_script": len(unknown),
+                "schema_tokens": mcp_tokens,
+                "schema_share_of_request_pct": (
+                    round(100.0 * mcp_tokens / wire_manifest, 1)
+                    if mcp_tokens and wire_manifest else None),
+                "names_withheld": True,
+                "note": ("measured on the wire" if mcp_tokens is not None else
+                         "re-run with --measure to fill schema_tokens; it is "
+                         "the only number here transcripts cannot give"),
+            },
+            "wire_manifest_tokens_measured": wire_manifest,
             "prices_usd_per_mtok": price,
         }
         for ln in json.dumps(blob, indent=2, sort_keys=True).splitlines():
