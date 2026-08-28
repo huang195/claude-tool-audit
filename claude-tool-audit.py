@@ -20,8 +20,8 @@ This script prices two against YOUR history:
      impossible from inside Claude Code, which cannot refresh its own cache.
 
 Neither changes the model, the context, or the information available to it.
-Together, 18.4% here. Send back the --report block so we can see how much that
-varies between people -- that is what decides whether it is worth building.
+Together, 18.4% here. Send the output back so we can see how much that varies
+between people -- that is what decides whether it is worth building.
 
 WHAT IT READS
 -------------
@@ -31,15 +31,14 @@ counts. It never reads prompts, tool arguments, tool results, or completions.
 
 WHAT IT SENDS
 -------------
-Nothing, ever, on its own. --measure makes exactly three `claude --print` calls
-with the fixed prompt "say ok" to weigh your real manifest. --report prints a
-block for you to paste wherever you choose: aggregate numbers and built-in tool
-names only, no paths, project names, branches, or MCP server names. The script
-changes no files and no settings.
+Nothing, anywhere. No API calls, no network. It reads transcripts, prints, and
+exits; it changes no files and no settings. The output is aggregate numbers and
+built-in tool names -- no paths, project names, branches, prompts, arguments, or
+MCP server names.
 
 USAGE
 -----
-    python3 claude-tool-audit.py --report --measure   # <-- please run this one
+    python3 claude-tool-audit.py                  # <-- send this output back
     python3 claude-tool-audit.py --verbose        # + per-tool detail
 
 CAVEATS, STATED UP FRONT
@@ -53,8 +52,7 @@ CAVEATS, STATED UP FRONT
 * "Never called" is not "never useful". A tool you have not needed yet may be
   the right tool next week, so A has to be able to put it back.
 * Per-tool token figures come from a wire capture of Claude Code 2.x and carry
-  roughly +/-15%. The aggregate is the solid number, and --measure replaces the
-  estimate with a direct measurement on your machine.
+  roughly +/-15%. The aggregate is the solid number; a single tool's line is not.
 """
 
 import argparse
@@ -64,9 +62,7 @@ import glob
 import json
 import math
 import os
-import subprocess
 import sys
-import tempfile
 import textwrap
 
 # ---------------------------------------------------------------------------
@@ -338,23 +334,6 @@ def cost_of(rows, price, extra=0.0, read_scale=1.0):
         for r in rows) / 1e6
 
 
-def lever_tools(rows, dead_tokens):
-    """Lever 1: the dead manifest stops being sent.
-
-    Those tokens leave every request's cache read, and leave the cache write on
-    every cold start (where the whole prefix is written afresh).
-    """
-    out = []
-    for r in rows:
-        q = dict(r)
-        if q["r"] > dead_tokens:
-            q["r"] -= dead_tokens
-        if q["cold"] and q["w"] > dead_tokens:
-            q["w"] -= dead_tokens
-        out.append(q)
-    return out
-
-
 def close_partners(live):
     """A tool whose partner is in use has to stay: dropping SendMessage while
     Agent is still offered would break the workflow it belongs to."""
@@ -492,63 +471,7 @@ def lever_refresh(rows, price, every=240.0, adaptive=True):
 
 
 # ---------------------------------------------------------------------------
-# Phase 2 -- optional live measurement (2 API calls, no proxy needed)
-# ---------------------------------------------------------------------------
-
-def measure(deny, mcp=False):
-    """Return ((baseline, denied, no_mcp), None) or (None, error).
-
-    Up to three `claude --print --output-format json` calls in an empty directory
-    with the same prompt. The only difference between them is the tool manifest,
-    so each prompt-token delta is exactly what those schemas cost per turn.
-
-    The third call adds --strict-mcp-config, which starts the session with no MCP
-    servers at all. That delta is the size of your MCP tool descriptions -- a
-    number nothing else reports, and the one quantity this whole analysis cannot
-    get from transcripts. `no_mcp` is None if the run was skipped or unsupported.
-    """
-    def one(settings_path, workdir, extra=()):
-        cmd = ["claude", "--print", "--output-format", "json", "say ok"]
-        cmd[1:1] = list(extra)
-        if settings_path:
-            cmd[1:1] = ["--settings", settings_path]
-        try:
-            out = subprocess.run(cmd, cwd=workdir, stdin=subprocess.DEVNULL,
-                                 capture_output=True, text=True, timeout=300)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            return None, "could not run claude: %s" % exc
-        if out.returncode != 0:
-            return None, (out.stderr or out.stdout or "").strip()[:300]
-        try:
-            u = json.loads(out.stdout)["usage"]
-        except Exception:
-            return None, "unexpected --output-format json payload"
-        return ((u.get("input_tokens") or 0)
-                + (u.get("cache_creation_input_tokens") or 0)
-                + (u.get("cache_read_input_tokens") or 0)), None
-
-    with tempfile.TemporaryDirectory() as work:
-        base, err = one(None, work)
-        if base is None:
-            return None, err
-        trimmed = None
-        if deny:
-            sp = os.path.join(work, "deny-settings.json")
-            with open(sp, "w") as fh:
-                json.dump({"permissions": {"deny": sorted(deny)}}, fh)
-            trimmed, err = one(sp, work)
-            if trimmed is None:
-                return None, err
-        no_mcp = None
-        if mcp:
-            # Older Claude Code has no --strict-mcp-config; a failure here is not
-            # fatal, it just means this one number is unavailable.
-            no_mcp, _ = one(None, work, extra=["--strict-mcp-config"])
-    return (base, trimmed, no_mcp), None
-
-
-# ---------------------------------------------------------------------------
-# Phase 3 -- settings edit
+# Phase 2 -- local configuration, for the profile section only
 # ---------------------------------------------------------------------------
 
 def configured_mcp_servers():
@@ -623,14 +546,10 @@ def table(rows, per_tok, turns):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Price three quality-neutral ways to cut your Claude Code "
+        description="Price two quality-neutral ways to cut your Claude Code "
                     "bill, against your own history.")
     ap.add_argument("--days", type=int, default=30,
                     help="lookback window in days (default 30)")
-    ap.add_argument("--report", action="store_true",
-                    help="print a paste-able summary block (aggregates only)")
-    ap.add_argument("--measure", action="store_true",
-                    help="verify lever 1 with 2 `claude --print` calls")
     ap.add_argument("--include-check-first", action="store_true",
                     help="also offer the tools flagged check-first")
     ap.add_argument("--verbose", action="store_true",
@@ -691,65 +610,9 @@ def main():
     candidates = low + (check if args.include_check_first else [])
     known = len([1 for v in TOOLS.values() if v[2] != "interactive"])
 
-    # --- measure first, so lever 1 can use a real number if we have one ----
-    measured = None
-    mcp_tokens = None
-    wire_manifest = None
-    if args.measure:
-        head("MEASURING AGAINST THE REAL API")
-        para("Sending requests with the prompt \"say ok\" from an empty directory "
-             "-- one with your normal tools, one with the dead ones switched "
-             "off, one with --strict-mcp-config. Each difference is exactly what "
-             "those schemas cost you, on your machine and your Claude Code "
-             "version.")
-        print()
-        res, err = measure(candidates, mcp=True)
-        if res is None:
-            para("Could not measure: %s" % err)
-        else:
-            base_tok, trimmed_tok, no_mcp_tok = res
-            wire_manifest = base_tok
-            print("    every tool on      %9s tokens in the request"
-                  % num(base_tok))
-            if trimmed_tok is not None:
-                measured = base_tok - trimmed_tok
-                print("    %2d tools off       %9s tokens in the request"
-                      % (len(candidates), num(trimmed_tok)))
-            if no_mcp_tok is not None:
-                mcp_tokens = max(0, base_tok - no_mcp_tok)
-                print("    no MCP servers     %9s tokens in the request"
-                      % num(no_mcp_tok))
-            print("    " + "-" * 46)
-            if measured:
-                print("    dead built-ins     %9s tokens, every request"
-                      % num(measured))
-                print("                       %8.1f%% of that request"
-                      % (100.0 * measured / base_tok if base_tok else 0))
-            if mcp_tokens is not None:
-                print("    MCP tool schemas   %9s tokens, every request"
-                      % num(mcp_tokens))
-                print("                       %8.1f%% of that request"
-                      % (100.0 * mcp_tokens / base_tok if base_tok else 0))
-                print()
-                para("That MCP figure is the one number the transcripts cannot "
-                     "show, so it only exists if you run --measure. Please "
-                     "include it.")
-            elif args.measure:
-                print()
-                para("MCP size unavailable -- your Claude Code may predate "
-                     "--strict-mcp-config. Everything else still stands.")
-            est = sum(tokens_of(n) for n in candidates)
-            if measured and est:
-                print()
-                para("The estimate below said %s tokens, so measured / "
-                     "estimated = %.2f. The measured number is used from here on."
-                     % (num(est), measured / est))
-
     # Price exactly the tools we are actually offering to switch off, so
     # --include-check-first changes the saving and not just the note below.
-    tot_offered = sum(tokens_of(n) for n in candidates)
-    dead_tokens = measured if measured else tot_offered
-    dead_source = "measured" if measured else "estimated"
+    dead_tokens = sum(tokens_of(n) for n in candidates)
 
     # --- the two levers, both in the request path -------------------------
     # A: rewrite the tools array per developer, from that developer's own call
@@ -816,8 +679,8 @@ def main():
     head("A -- TOOL SCHEMAS SENT ON EVERY REQUEST, NEVER CALLED")
     pool_names = {n for n, v in TOOLS.items()
                   if v[2] != "interactive" and v[0] > 0}
-    print("  %d of %d schemas never called, %s tokens/request (%s)"
-          % (len(never), len(pool_names), num(dead_tokens), dead_source))
+    print("  %d of %d schemas never called, %s tokens/request (estimated)"
+          % (len(never), len(pool_names), num(dead_tokens)))
     if low:
         print(textwrap.fill(" ".join(sorted(low)), width=WIDTH,
                             initial_indent="    ", subsequent_indent="    "))
@@ -884,93 +747,14 @@ def main():
         print("  MCP                        %d server(s) configured, %d used, "
               "%d tool(s) called" % (len(servers), len(servers) - len(idle),
                                      len(unknown)))
-        if mcp_tokens is not None:
-            print("  MCP schemas on the wire    %s tokens/request (%s)"
-                  % (num(mcp_tokens),
-                     pct(mcp_tokens / wire_manifest if wire_manifest else 0)))
-        else:
-            print("  MCP schemas on the wire    unknown -- pass --measure; "
-                  "transcripts cannot show it")
         if idle:
             print("  never used                 %s   <- delete this line before "
                   "pasting" % ", ".join(idle))
     print()
     print("  Read from your transcripts: tool names, ids, timestamps, session")
     print("  ids, token counts. Never prompts, arguments, results or replies.")
-    print("  Nothing leaves your machine unless you pass --measure.")
-
-    # --- 9. the paste-able block ------------------------------------------
-    # --- the paste-able block ---------------------------------------------
-    if args.report:
-        head("PASTE THIS BACK")
-        print("  Aggregate numbers and built-in tool names only. No paths,")
-        print("  project names, branches, prompts, arguments, or MCP server")
-        print("  names. Please run it as `--report --measure` if you can.")
-        print()
-
-        def p(x):
-            return round(100.0 * x / baseline, 1) if baseline else None
-
-        blob = {
-            "schema": "claude-cost-audit/4",
-            "days": args.days,
-            "to": s["last"].date().isoformat() if s["last"] else None,
-            "claude_code": sorted(s["versions"])[-1:],
-            "requests": s["turns"],
-            "lineages": len(s["sessions"]),
-            "tool_calls": s["calls"],
-            "usd": {
-                "total": round(baseline, 2),
-                "cache_read": round(next(c for n, t, c in comp
-                                         if n == "cache read"), 2),
-                "cache_write": round(next(c for n, t, c in comp
-                                          if n == "cache write"), 2),
-                "output": round(next(c for n, t, c in comp
-                                     if n == "output"), 2),
-                "input": round(next(c for n, t, c in comp
-                                    if n == "uncached input"), 2),
-            },
-            "tokens": {k: u[k] for k in sorted(u)},
-            "saved_pct": {
-                "a_dynamic": p(baseline - cost_a),
-                "a_dynamic_ceiling": p(baseline - dyn["oracle"]),
-                "b_refresh": p(baseline - cost_b_only),
-                "a_and_b": p(baseline - cost_ab),
-            },
-            "refresh_sweep_pct": sweep,
-            "shape": {
-                "mean_context_tokens": mean_ctx,
-                "manifest_tokens": dyn["pool_tokens"],
-                "manifest_share_pct": round(
-                    100.0 * dyn["pool_tokens"] / mean_ctx, 1) if mean_ctx else None,
-                "cold_starts": ref["gaps"],
-                "cold_start_pct": round(100.0 * ref["gaps"] / s["turns"], 1)
-                                  if s["turns"] else None,
-                "cold_start_write_share_pct": round(100.0 * cold_w / all_w, 1),
-                "gaps_worth_refreshing": ref["wins"],
-                "top1_lineage_pct": p(lc[0]) if lc else None,
-                "top4_lineages_pct": p(sum(lc[:4])) if lc else None,
-                "trimmable_lineages": [dyn["reached"], dyn["lineages"]],
-            },
-            "manifest": {
-                "dead_tokens": int(dead_tokens),
-                "source": dead_source,
-                "wire_total_tokens": wire_manifest,
-                "tools_priced": dyn["pool_tools"],
-                "tools_called": len(pool_names & set(called)),
-                "never_called": sorted(low),
-                "never_called_risky": sorted(check),
-            },
-            "mcp": {
-                "servers": len(servers),
-                "servers_unused": len(idle),
-                "tools_called": len(unknown),
-                "schema_tokens": mcp_tokens,
-            },
-            "prices_usd_per_mtok": price,
-        }
-        for ln in json.dumps(blob, indent=2, sort_keys=True).splitlines():
-            print("  " + ln)
+    print("  Nothing left your machine: no API calls, no network, no writes.")
+    print("  Send this output back -- it is aggregates and built-in tool names.")
 
     print()
     return 0
