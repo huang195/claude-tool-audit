@@ -52,17 +52,27 @@ which cost answer quality. They are about not paying twice for the same bytes.
 | **B** | refresh a cache lineage before its 5-minute timer expires | **12.2%** | Claude Code cannot refresh its own cache |
 | | **A + B** | **16.8%** | |
 
-Across six developers measured so far, A lands between **3.1% and 18.9%** and B
+Across seven developers measured so far, A lands between **3.1% and 18.9%** and B
 between **5.7% and 29.7%**. Which lever is larger **depends on the person** — B
-leads on four of the six — so the numbers below are one machine's, not a forecast
-for yours. Weighted across all six bills, A is worth 8.7% and B is worth 16.8%.
+leads on five of the seven — so the numbers below are one machine's, not a forecast
+for yours. Weighted across all seven bills, A is worth 8.7% and B is worth 16.8%.
+
+Lever A's size, at least, is predictable from a single number. The droppable
+manifest is roughly **fixed** at 20.5 k tokens, so the share of context it occupies
+is just `20.5 k / mean context` — 13.4% on a 153 k machine, 4.5% on a 452 k one,
+both exact. Lever A then lands at a consistent **0.64–0.73×** of that share across
+every machine measured, which makes it a straight function of how large your
+conversations get: the bigger your context, the less lever A is worth to you. Lever
+B does **not** move monotonically the other way, so this predicts A's magnitude, not
+which lever wins.
 
 The single quantity that has *not* varied is lever B's **capture rate** — the
 fraction of the addressable pool it recovers. It sat at 40–53% across the first
-five machines, and the sixth, whose usage profile resembled none of them (8 cache
+five machines. The sixth, whose usage profile resembled none of them (8 cache
 lineages against 68, a 452 k mean context against 232 k, and cache writes
-outweighing cache reads), came in at 47%. That is the closest thing here to an
-out-of-sample test.
+outweighing cache reads), came in at 47%; the seventh at 53%. Those are the closest
+thing here to an out-of-sample test, and both landed inside a band set before they
+were measured.
 
 Both live in the request path. Neither changes the bytes the model receives.
 
@@ -84,10 +94,10 @@ needs foresight, so it is not implementable — but it is a genuine upper bound,
 the gap between 5.6% and 6.4% is what per-conversation trimming would be worth on
 top of per-developer trimming.
 
-On the per-developer claim, be careful: across six measured machines the droppable
-sets turned out to be **nested**, not disjoint. Eight tools were dead on every
-single machine, and one shared nine-tool list would capture at least 70% of each
-person's dead tokens. That part is achievable with a static config and no proxy.
+On the per-developer claim, be careful: across the six machines whose dead-tool
+lists were compared directly, the droppable sets turned out to be **nested**, not
+disjoint. Eight tools were dead on every single machine, and one shared nine-tool
+list would capture at least 70% of each person's dead tokens. That part is achievable with a static config and no proxy.
 What is *not* achievable statically is the per-conversation ceiling above, and the
 timing of when to apply the change.
 
@@ -119,7 +129,7 @@ The measurement that makes this a real finding:
 | refresh requests that adds | 406 |
 
 4.7% of requests carry 77.4% of the most expensive token class. That concentration
-is what makes a narrow intervention worth anything. It reproduces: across six
+is what makes a narrow intervention worth anything. It reproduces: across seven
 machines the idle-gap requests were **1.9–14.3%** of traffic and carried
 **76–94%** of all cache writes, and lever B captured **40–53%** of that
 addressable pool every time — a band that held even on the machine whose usage
@@ -192,14 +202,27 @@ None are needed. If you want them:
 - Prices default to Opus list, and **real traffic is mixed-model.** The reference
   machine here turned out to be 80.8% Opus 5, 7.6% Sonnet 5, 7.5% Opus 4.8 — so
   even its own dollar column is an approximation, and a machine that is mostly
-  Sonnet is overstated considerably. The script now prints the model mix so you can
-  see how far off the basis is, and `--price-*` lets you correct it. **Every
-  percentage in this README survives a wrong price basis** — `cache_write /
-  cache_read` is 12.5 on every model tier, and both levers are ratios of cache
-  cost to total cost. Only the dollars move.
+  Sonnet is overstated considerably. Another came back 18.7% Sonnet, and one had
+  **no Opus 5 at all**, which makes its dollar column the least trustworthy of the
+  set. The script now prints the model mix so you can see how far off the basis is,
+  and `--price-*` lets you correct it. **Every percentage in this README survives a
+  wrong price basis** — `cache_write / cache_read` is 12.5 on every model tier, and
+  both levers are ratios of cache cost to total cost. Only the dollars move.
+- **A short window overstates lever A, and only lever A.** A is priced entirely off
+  tools that were never called, so a window your transcripts do not fill counts
+  every tool you had no chance to reach yet — four days of history exercised 16
+  distinct tools where a full month elsewhere exercised 22. Lever B reads idle gaps,
+  which occur at any window length, so it is not biased this way. The script prints
+  a warning below 80% coverage. One run excluded from the figures above for exactly
+  this reason reported a 21.2% lever A that equalled its own theoretical ceiling —
+  which is what saturating the whole droppable pool looks like, not a narrow
+  workflow.
 - The reference figures are **one dated 30-day run**, not a live number. The window
   rolls, so re-running tomorrow gives a different total. Percentages have been
-  stable across re-runs; dollars have not.
+  stable across re-runs; dollars have not. That run's window was genuinely full when
+  it was taken, but the machine's transcript history has since been pruned to 15
+  days, so it is no longer reproducible from local files — which is also why the
+  coverage warning now fires there.
 
 ## What to send back
 
