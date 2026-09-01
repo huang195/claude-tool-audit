@@ -701,15 +701,20 @@ def main():
     head("A -- TOOL SCHEMAS SENT ON EVERY REQUEST, NEVER CALLED")
     pool_names = {n for n, v in TOOLS.items()
                   if v[2] != "interactive" and v[0] > 0}
-    print("  %d of %d schemas never called, %s tokens/request (estimated)"
-          % (len(never), len(pool_names), num(dead_tokens)))
+    # len(never) counts everything never called; dead_tokens prices only the
+    # subset lever A actually drops. Printing the two side by side without
+    # saying so read as "12 schemas = 15,104 tokens", which is wrong whenever
+    # some of the 12 are partner-kept below.
+    print("  %d of %d schemas never called; A drops %d of them, %s tokens/"
+          "request (estimated)"
+          % (len(never), len(pool_names), len(candidates), num(dead_tokens)))
     if low:
         print(textwrap.fill(" ".join(sorted(low)), width=WIDTH,
                             initial_indent="    ", subsequent_indent="    "))
     if check:
-        print("  %d more never called, but each partners a tool in use, so A"
+        print("  %d of those partner a tool in use, so A keeps them"
               % len(check))
-        print("  keeps them (%s tokens):" % num(tot_check))
+        print("  (%s tokens, still shipped every request):" % num(tot_check))
         print(textwrap.fill(" ".join(sorted(check)), width=WIDTH,
                             initial_indent="    ", subsequent_indent="    "))
     print("  ceiling if each conversation also dropped what only IT never"
@@ -765,16 +770,22 @@ def main():
     used = {n.split("__")[1] for n in called if n.startswith("mcp__")
             and len(n.split("__")) > 2}
     idle = sorted(servers - used)
-    if servers or unknown:
-        print("  MCP                        %d server(s) configured, %d used, "
-              "%d tool(s) called" % (len(servers), len(servers) - len(idle),
-                                     len(unknown)))
+    if servers:
+        print("  MCP                        %d server(s) configured, %d used"
+              % (len(servers), len(servers) - len(idle)))
         # Deliberately a count, not the names. A server name can identify an
         # internal system, and a "delete this before pasting" marker is not a
         # control: the first person who hit one pasted it anyway.
         if idle:
             print("  never used                 %d of those server(s), no tool "
                   "called in %d days" % (len(idle), args.days))
+    # These are calls to tools with no row in the token table -- a newer Claude
+    # Code than the wire capture, or an MCP tool. They are NOT priced by lever A.
+    # This used to print on the MCP line, which read as "N MCP tools called"
+    # even with zero servers configured.
+    if unknown:
+        print("  not in the token table     %d tool(s) called, so unpriced here"
+              % len(unknown))
     print()
     print("  Read from your transcripts: tool names, ids, timestamps, session")
     print("  ids, token counts. Never prompts, arguments, results or replies.")
