@@ -671,6 +671,19 @@ def main():
               % ("Opus list" if price == PRICE else "overridden prices",
                  ", ".join("%s %s" % (m, pct(c / tot_m))
                            for m, c in s["models"].most_common(3))))
+    # A tool unused in four days is not a tool this developer never uses, and
+    # lever A is priced entirely off "never called" -- so a window the
+    # transcripts do not fill overstates it. Lever B reads idle gaps, which
+    # occur at any window length, so it is not biased the same way. Say this
+    # out loud: otherwise a fresh install's run gets compared straight against
+    # a full month's and the difference is read as a difference in workflow.
+    if s["first"] and s["last"]:
+        span = (s["last"] - s["first"]).days + 1
+        if span < 0.8 * args.days:
+            print("  NOTE  transcripts cover %d of the %d days requested, so"
+                  " lever A is" % (span, args.days))
+            print("        overstated -- it counts tools you had no chance to"
+                  " call yet. B is not.")
     print()
     print("  %-16s %14s %10s %7s" % ("", "tokens", "cost", "share"))
     for n, t, c in comp:
